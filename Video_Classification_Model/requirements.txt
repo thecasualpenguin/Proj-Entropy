@@ -1,12 +1,8 @@
-tensorflow-gpu
-scikit-learn
-matplotlib
-keras
-h5py
-scipy
+# The existing `entropy` Conda environment already provides these packages.
+# This file documents the PyTorch-only supervised baseline.
 numpy
 pandas
-pytz
-six
-tqdm
-tzdata
+scikit-learn
+matplotlib
+PyYAML
+torch

@@ -1,0 +1,40 @@
+# Run this example from Video_Classification_Model after adjusting paths if needed.
+run:
+  output_root: runs
+  name: example_resnet
+
+data:
+  mode: auto
+  data_path: 1-dataset/entropy 4167 sample dataset/train-data.csv
+  label_path: 1-dataset/entropy 4167 sample dataset/train-labels.csv
+  train_data_path: null
+  train_label_path: null
+  val_data_path: null
+  val_label_path: null
+  test_data_path: null
+  test_label_path: null
+model:
+  initial_feature_maps: 128
+training:
+  seed: 42
+  learning_rate: 0.001
+  batch_size: 64
+  max_epochs: 300
+  optimizer: Adam
+  class_imbalance: none
+  early_stopping:
+    monitor: validation_loss
+    patience: 25
+    min_improvement: 0.001
+  scheduler:
+    factor: 0.1
+    patience: 10
+    min_lr: 0.00001
+  checkpoint_frequency: 1
+  device: auto
+  num_workers: 0
+preprocessing:
+  method: per_sequence_zscore
+  sequence_length: 3000
+  standard_deviation: population
+  epsilon: null

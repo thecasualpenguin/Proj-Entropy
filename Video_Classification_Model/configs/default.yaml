@@ -1,0 +1,43 @@
+# Validated defaults for the supervised PyTorch 1-D ResNet pipeline.
+run:
+  output_root: runs
+  name: null                 # CLI --run-name, or a generated timestamp when null
+
+data:
+  mode: auto                 # auto or manual
+  data_path: null            # auto: CSV containing size0..size2999
+  label_path: null
+  train_data_path: null      # manual mode
+  train_label_path: null
+  val_data_path: null
+  val_label_path: null
+  test_data_path: null
+  test_label_path: null
+
+model:
+  initial_feature_maps: 128
+
+training:
+  seed: 42
+  learning_rate: 0.001
+  batch_size: 64
+  max_epochs: 300
+  optimizer: Adam            # Adam or AdamW
+  class_imbalance: none      # none or weighted
+  early_stopping:
+    monitor: validation_loss
+    patience: 25
+    min_improvement: 0.001
+  scheduler:
+    factor: 0.1
+    patience: 10
+    min_lr: 0.00001
+  checkpoint_frequency: 1
+  device: auto               # auto, cpu, cuda, cuda:N, or mps
+  num_workers: 0
+
+preprocessing:
+  method: per_sequence_zscore
+  sequence_length: 3000
+  standard_deviation: population
+  epsilon: null              # zero-variance rows are rejected; no epsilon is applied
