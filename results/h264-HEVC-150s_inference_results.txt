@@ -1,2 +1,0 @@
-Progress: 1/4400 videos processed
-Video: /mnt/hbnas/datasets/video_classification_videos/h264-HEVC-150s/trans/Beauty & Fashion/Yuya/Yuya165.mp4, Inference Result: Music
