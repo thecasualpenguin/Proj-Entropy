@@ -16,7 +16,7 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "src"))
-import supervised as app
+import run_pipeline as app
 from supervised_data import (FEATURE_COLUMNS, automatic_split, load_pair, manual_split,
                              normalize_rows)
 

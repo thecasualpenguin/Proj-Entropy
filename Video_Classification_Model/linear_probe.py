@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Frozen linear probes for residual blocks in a modern supervised run.
 
-The probe consumes a ``supervised.py`` format-version-1 checkpoint and its
+The probe consumes a ``run_pipeline.py`` format-version-1 checkpoint and its
 recorded split manifest.  It never trains or changes the encoder.
 """
 from __future__ import annotations
@@ -33,7 +33,7 @@ from torch.utils.data import DataLoader, TensorDataset
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE / "src"))
 from model_resnet_tsc import ResNet
-from supervised import choose_device
+from run_pipeline import choose_device
 from supervised_data import PairData, load_pair, normalize_rows
 
 PREPROCESSING = {"method": "per_sequence_zscore", "sequence_length": 3000,

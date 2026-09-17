@@ -174,3 +174,4 @@ cython_debug/
 #.idea/
 /Video_Classification_Model/1-dataset
 /Video_Classification_Model/runs
+/.DS_Store
