@@ -1,0 +1,5 @@
+outputs/
+__pycache__/
+runs/
+/.DS_Store
+/ffmpeg_bitrate_stats/.DS_Store
