@@ -1,8 +1,7 @@
 # A Zero Decoding Approach to Video Classification
 *Chen Ye Gan, Jiangtao Wen, Yuxing Han*
 
-
-This repository is the official implementation of **A Zero Decoding Approach to Video Classification**, accepted at ICME 2025. 
+This repository is the official implementation of **A Zero Decoding Approach to Video Classification**, accepted at ICME 2025.
 
 [![Paper](https://img.shields.io/badge/Paper-ICME_2025-blue)](link-to-camera-ready)
 [![Python](https://img.shields.io/badge/Python-3.9%2B-green)](https://www.python.org/)
@@ -14,72 +13,45 @@ This repository is the official implementation of **A Zero Decoding Approach to 
 - ~90 % accuracy on a 6,000hr YouTube dataset (11 classes).
 - **7 orders-of-magnitude** faster than DTW, **3 orders** faster than CNN baselines.
 
-
 <p align="center" width="100%">
-<img src="overview.png"  width="100%" height="100%">
+<img src="overview.png" width="100%" height="100%">
 </p>
 
 ## Table of Contents
-1. [Overview](#overview)  
-2. [Dataset](#dataset)  
-3. [Installation](#installation)  
-4. [Quick Start](#quick-start)  
-5. [Citation](#citation)  
-6. [Acknowledgements](#acknowledgements)
-7. [Contributing](#contributing)
+1. [Overview](#overview)
+2. [Installation](#installation)
+3. [Quick Start](#quick-start)
+4. [Citation](#citation)
+5. [Acknowledgements](#acknowledgements)
+6. [Contributing](#contributing)
 
 <a name="overview"></a>
 ## Overview
 
 *Abstract* — Classifying videos into distinct categories, such as Sport and Music Video, is crucial for multimedia understanding and retrieval, especially with growing content volume. Traditional methods require video decompression to extract pixel level features like color, texture, and motion, thereby increasing computational and storage demands. We present a novel approach that examines only the compressed bitstream of a video to perform classification, eliminating the need for bitstream decoding. To validate our approach, we built a comprehensive data set comprising over 29,000 YouTube video clips, totaling 6,000 hours and spanning 11 distinct categories. Our evaluations indicate precision, accuracy, and recall rates consistently above 80%, many exceeding 90%, and some reaching 99%. The algorithm operates approximately 15,000 times faster than real-time for 30fps videos, outperforming traditional Dynamic Time Warping (DTW) algorithm by seven orders of magnitude and state-of-the-art video classification model by three orders of magnitude.
 
-<a name="dataset"></a>
-## Custom Dataset
-### Download
-We created a large dataset consisting of 29,142 video clips, each containing at least 3,000 frames.
-[Download](https://tinyurl.com/bitstream-video-data)
-
-<p align="center" width="100%">
-<img src="dataset_thumbnail.png"  width="80%" height="80%">
-</p>
-
-### Data preprocessing
-Transcoded the input video to different Mbps using the FFmpeg open-source H.264/AVC encoder with the same encoding settings.
-
-```
-Average Bitrate (ABR) mode: ffmpeg -i input.mp4 -c:v libx264 -b:v 1.5M output.mp4
-Constant Bitrate (CBR) mode: ffmpeg -i input.mp4 -c:v libx264 -crf 23 output.mp4
-```
-
 <a name="installation"></a>
 ## Installation
 
-The complete implementation is located in the `Video_Classification_Model` folder.
-
+The maintained supervised pipeline is in `Video_Classification_Model`. From the repository root, install its Python dependencies with pip:
 
 ```sh
-## pip
-pip install -r requirements.txt
-
-## conda
-conda create --name entropy --file entropy-env.txt
-conda activate entropy
+python -m pip install -r Video_Classification_Model/requirements.txt
 ```
 
 <a name="quick-start"></a>
 ## Quick Start
 
-Overview: videos -> covers -> design matrix -> train -> eval -> predict
+Before running the pipeline, prepare a **well-formed packet-size data CSV and matching label CSV**. Video extraction is not part of the current pipeline. The data CSV must already contain the required `size0` through `size2999` columns, and the label CSV must already be aligned row-for-row with it.
 
-1. place videos to extract in folder `1-input_videos`
-2. run `python extract.py`
-3. the extracted covers are placed in `2-covers`
-    - The resulting CSVs will have three columns, namely Video Path, Frame Number, Frame size (in bytes)
-4. run `python collate.py` to collate covers into a single well formatted design matrix, saved in `3_model_input_data`
-5. run `python train.py`, checkpoints saved in `4_checkpoints`
-6. run `python eval.py` to evaluate, be sure to change `CHECKPOINT_PATH` before running
-7. run `python predict.py` to predict on new dataset, which needs to be in a design matrix. Change `MODEL_PATH` and `data_path` accordingly. 
+```sh
+cd Video_Classification_Model
+python run_pipeline.py train --config configs/default.yaml --run-name my_run
+```
 
+Set the data paths and training options in a copy of `configs/default.yaml` before training. The command creates a run, trains, and evaluates its saved test split after normal completion or early stopping. To use the interactive equivalent instead, run `python run_pipeline.py` with no arguments.
+
+See [`Video_Classification_Model/README.md`](Video_Classification_Model/README.md) for the exact CSV schema and preprocessing, configuration, training/resume and evaluation commands, outputs, tests, and linear probes.
 
 <a name="citation"></a>
 ## Citation
@@ -97,11 +69,9 @@ Overview: videos -> covers -> design matrix -> train -> eval -> predict
 
 The authors thank Yuchen Deng and Fengpu Pan for their assistance in data collection and Haoyue Han for paper review.
 
-This work is supported by Shenzhen Startup Funding No.QD2023014C. 
-
+This work is supported by Shenzhen Startup Funding No.QD2023014C.
 
 <a name="contributing"></a>
 ## Contributing
 
 We would like to keep this version archival to match our paper's results, but freel free to fork or clone the repository—just don’t forget to give us a shout-out!
-
