@@ -1,6 +1,10 @@
 # Supervised packet-sequence classification (PyTorch)
 
-This directory contains the maintained supervised PyTorch pipeline for classifying 3,000-packet video sequences with the 1-D ResNet in `src/model_resnet_tsc.py`. `run_pipeline.py` is the training and evaluation entry point; `linear_probe.py` evaluates frozen representations from compatible trained checkpoints.
+This directory contains the maintained supervised PyTorch pipeline for classifying 3,000-packet video sequences. `model.architecture: resnet` remains the default; `transformer` selects the local patch Transformer. `run_pipeline.py` is the training and evaluation entry point; `linear_probe_resnet.py` evaluates frozen ResNet representations only.
+
+## Transformer option
+
+Transformer defaults are 16-packet nonoverlapping patches, width 32, 4 heads, two pre-LN GELU layers, feed-forward width 64, and dropout 0.2. With `model.length_aware: true`, a CSV row must contain a contiguous nonzero packet prefix then zeros; holes and all-zero rows are rejected. Its preprocessing must be `train_global_valid_zscore` with population statistics, `padding: zero`, and `lengths: contiguous_nonzero_prefix`: one global mean/std is fit from valid train packets only and reused for validation/test, with padded suffixes forced to zero. Format-version-2 checkpoints store this metadata/statistics, architecture, split provenance, optimizer/scheduler/RNG, and lifecycle state; older checkpoints are rejected. The ResNet probe explicitly rejects transformer checkpoints.
 
 ## Installation
 
@@ -117,25 +121,25 @@ Evaluation artifacts include JSON and CSV summary/per-class metrics, raw and row
 
 ## Frozen linear probes
 
-`linear_probe.py` reads a modern `run_pipeline.py` format-version-1 checkpoint. It reconstructs the frozen ResNet encoder and validates the saved preprocessing, contiguous label mapping, recorded split manifest, source checksums, and split integrity. It does not train or alter the encoder.
+`linear_probe_resnet.py` reads a modern `run_pipeline.py` format-version-2 checkpoint. It reconstructs the frozen ResNet encoder and validates the saved preprocessing, contiguous label mapping, recorded split manifest, source checksums, and split integrity. It does not train or alter the encoder.
 
 ```sh
-python linear_probe.py --checkpoint runs/resnet_001/checkpoints/best.pt
+python linear_probe_resnet.py --checkpoint runs/resnet_001/checkpoints/best.pt
 
 # Override device and probe settings.
-python linear_probe.py --checkpoint runs/resnet_001/checkpoints/best.pt \
+python linear_probe_resnet.py --checkpoint runs/resnet_001/checkpoints/best.pt \
   --device cpu --batch-size 64 --c 0.01 0.1 1 10 --max-iter 1000 \
   --output-root /path/to/probe_outputs
 
 # For an automatic-split run whose original pair was relocated, supply a
 # byte-identical data/label pair; its SHA-256 checksums must match.
-python linear_probe.py --checkpoint runs/resnet_001/checkpoints/best.pt \
+python linear_probe_resnet.py --checkpoint runs/resnet_001/checkpoints/best.pt \
   --data-path /new/location/data.csv --label-path /new/location/labels.csv
 ```
 
 The script uses the temporal mean of each residual block (blocks 1–3; block 3 is the encoder final global-average-pool representation). For every block and each requested positive `C`, it fits a `StandardScaler` and multinomial `LogisticRegression` (`lbfgs`) on training features only, then selects the `C` with highest validation macro-F1 (ties choose the smaller `C`). It then refits the selected probe on train plus validation and evaluates the test split once. Test labels are excluded from selection.
 
-For automatic-split checkpoints, `--data-path` and `--label-path` may relocate the single original pair only when both are supplied and byte-identical by SHA-256. Manual-split checkpoints require their recorded three source paths and do not accept these overrides. Only checkpoints with the required format-version-1 fields and fixed preprocessing are accepted; incompatible checkpoints are rejected.
+For automatic-split checkpoints, `--data-path` and `--label-path` may relocate the single original pair only when both are supplied and byte-identical by SHA-256. Manual-split checkpoints require their recorded three source paths and do not accept these overrides. Only checkpoints with the required format-version-2 fields and architecture-specific preprocessing are accepted; incompatible checkpoints are rejected.
 
 By default, results are written to `RUN_DIR/linear_probes/TIMESTAMP` (or below `--output-root`). The directory contains `metadata.json`, selection metrics in JSON/CSV, selection plots for accuracy, macro-F1, and log loss, and `final_test_metrics_by_block.png`. Each `block1`, `block2`, and `block3` directory contains final metrics and per-class metrics (JSON/CSV), raw and normalized confusion-matrix CSVs, plus the fitted `scaler.joblib` and `probe.joblib`. When a valid original ResNet test artifact is available, it is recorded and displayed only as a reference; it does not influence selection.
 
@@ -149,8 +153,15 @@ python -m unittest discover -s tests -v
 
 The tests cover strict CSV loading and preprocessing, splitting and duplicate protections, checkpoint/lifecycle/resume behavior, evaluation artifacts, and frozen-probe compatibility, integrity checks, selection, and outputs.
 
-## Planned extraction handoff — not yet implemented
+## Packet-dataset extraction
 
-Video-to-CSV extraction is deliberately outside the current pipeline and must remain an independent, hot-swappable producer: it must not import, invoke, or have a hard runtime connection to `run_pipeline.py`. The integration boundary is output-only—the producer writes CSVs, and this pipeline consumes them through the contract above.
+`extract_packet_dataset.py` is a standalone producer; it does not invoke or import `run_pipeline.py`. It requires `ffprobe` from FFmpeg on `PATH` and expects an input tree of `class/group/.../video` (class labels and group names are taken literally):
 
-A future extraction script should recursively discover videos; obtain FFmpeg packet sizes; emit one 3,000-packet row per usable sequence; derive labels from directory structure or a supplied manifest; and write separate data and label CSVs in **bits** with the exact schema described above. Before declaring output ready, it should validate the loader contract (column names/order, numeric finite nonnegative values, nonconstant rows, and matching one-column labels). It should report short videos/sequences, invalid inputs, and FFmpeg or processing failures concisely and actionably. No extraction CLI is defined or implemented at present.
+```sh
+python Video_Classification_Model/extract_packet_dataset.py \
+  --input-dir /path/to/UCF11_updated_mpg
+```
+
+It recursively includes common video extensions without consulting annotation or exclusion files, selects the default video stream (or the first video stream), and writes packet sizes in bits. Output defaults to `Video_Classification_Model/extracted_frames` regardless of the current directory. Use `--output-dir /path/to/output` to choose another destination and `--overwrite` only to replace this tool's existing `manifest.csv` and split directories.
+
+The output has `manifest.csv` plus `train`, `validation`, and `test` directories, each with `*-data.csv` (`size0` through `size2999`) and `*-labels.csv` (`class_label`). Each video yields one 3,000-value vector: packet sizes are truncated after 3,000 or zero-padded. Groups, not individual videos, are assigned to deterministic per-class train/validation/test splits (default `0.68/0.16/0.16`, seed `42`), so a group never leaks across splits. Override ratios with `--train-ratio`, `--validation-ratio`, and `--test-ratio`, or the seed with `--seed`.

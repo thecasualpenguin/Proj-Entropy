@@ -33,14 +33,16 @@ from torch.utils.data import DataLoader, TensorDataset
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE / "src"))
-from model_resnet_tsc import ResNet
+from model_factory import make_model, validate_model_config
 from supervised_data import (PairData, automatic_split, load_pair,
-                             manual_split, normalize_rows)
+                             manual_split, normalize_length_aware, normalize_rows)
 
-PREPROCESSING = {
-    "method": "per_sequence_zscore", "sequence_length": 3000,
-    "standard_deviation": "population", "epsilon": None,
-}
+CHECKPOINT_FORMAT_VERSION = 2
+RESNET_PREPROCESSING = {"method": "per_sequence_zscore", "sequence_length": 3000, "standard_deviation": "population", "epsilon": None}
+TRANSFORMER_PREPROCESSING = {"method": "train_global_valid_zscore", "sequence_length": 3000, "standard_deviation": "population", "padding": "zero", "lengths": "contiguous_nonzero_prefix"}
+TRANSFORMER_DEFAULTS = {"patch_size": 16, "d_model": 32, "nhead": 4, "num_layers": 2,
+                        "dim_feedforward": 64, "dropout": 0.2, "length_aware": True}
+def preprocessing_for(model): return TRANSFORMER_PREPROCESSING if model["architecture"] == "transformer" and model["length_aware"] else RESNET_PREPROCESSING
 STATES = ("initializing", "running", "paused", "early_stopped", "complete", "failed")
 
 
@@ -91,7 +93,8 @@ def validate_config(raw: Mapping[str, Any]) -> Dict[str, Any]:
     for section, values in raw.items():
         if not isinstance(values, Mapping):
             raise ValueError(f"configuration section {section!r} must be a mapping")
-        unknown_keys = set(values) - set(cfg[section])
+        allowed_keys = set(cfg[section]) | ({"architecture", "initial_feature_maps", "patch_size", "d_model", "nhead", "num_layers", "dim_feedforward", "dropout", "length_aware"} if section == "model" else ({"method", "sequence_length", "standard_deviation", "padding", "lengths"} if section == "preprocessing" else set()))
+        unknown_keys = set(values) - allowed_keys
         if unknown_keys:
             raise ValueError(f"unknown keys in {section}: {sorted(unknown_keys)}")
         for key, value in values.items():
@@ -112,8 +115,20 @@ def validate_config(raw: Mapping[str, Any]) -> Dict[str, Any]:
         raise ValueError(f"missing required data paths: {missing}")
     for k in required:
         d[k] = str(Path(d[k]).expanduser().resolve())
+    architecture = m.get("architecture")
+    if architecture not in ("resnet", "transformer"): raise ValueError("model.architecture must be resnet or transformer")
+    # Transformer defaults are architecture-specific, so selecting the architecture
+    # does not require duplicating every hyperparameter in a user config.
+    if architecture == "transformer":
+        m = {**TRANSFORMER_DEFAULTS, **m}
+    # A user may not supply inactive architecture settings.
+    keep = {"architecture", "initial_feature_maps"} if architecture == "resnet" else {"architecture", "patch_size", "d_model", "nhead", "num_layers", "dim_feedforward", "dropout", "length_aware"}
+    supplied_model = raw.get("model", {})
+    inactive = set(supplied_model) - keep
+    if inactive: raise ValueError(f"unsupported {architecture} model settings: {sorted(inactive)}")
+    cfg["model"] = m = {k: v for k, v in m.items() if k in keep}
+    validate_model_config(m)
     numeric_positive = {
-        "model.initial_feature_maps": m["initial_feature_maps"],
         "training.learning_rate": t["learning_rate"], "training.batch_size": t["batch_size"],
         "training.max_epochs": t["max_epochs"], "training.early_stopping.patience": t["early_stopping"]["patience"],
         "training.scheduler.patience": t["scheduler"]["patience"],
@@ -133,9 +148,12 @@ def validate_config(raw: Mapping[str, Any]) -> Dict[str, Any]:
         raise ValueError("scheduler.factor must be between 0 and 1")
     if float(t["scheduler"]["min_lr"]) < 0 or float(t["early_stopping"]["min_improvement"]) < 0:
         raise ValueError("minimum learning rate and minimum improvement cannot be negative")
-    expected_prep = PREPROCESSING
+    expected_prep = preprocessing_for(m)
+    if m["architecture"] == "transformer" and m["length_aware"]:
+        cfg["preprocessing"] = (dict(expected_prep) if "preprocessing" not in raw
+                                  else dict(raw["preprocessing"]))
     if cfg["preprocessing"] != expected_prep:
-        raise ValueError(f"preprocessing is fixed for compatibility and must equal {expected_prep}")
+        raise ValueError(f"preprocessing must equal the architecture-specific value {expected_prep}")
     cfg["run"]["output_root"] = str(Path(cfg["run"]["output_root"]).expanduser().resolve())
     return cfg
 
@@ -210,12 +228,12 @@ def pair_meta(pair: PairData) -> Dict[str, Any]:
 def prepare_new_data(cfg: Mapping[str, Any], run: Path) -> Tuple[Dict[str, PairData], Dict[str, Any], Dict[str, int]]:
     d, seed = cfg["data"], cfg["training"]["seed"]
     if d["mode"] == "auto":
-        source = load_pair(d["data_path"], d["label_path"])
+        source = load_pair(d["data_path"], d["label_path"], cfg["model"]["architecture"] == "transformer" and cfg["model"]["length_aware"])
         pieces, detail = automatic_split(source, seed=seed)
         manifest = {"mode": "auto", "seed": seed, "ratios": {"train": .70, "validation": .15, "test": .15},
                     "sources": {"source": pair_meta(source)}, "splits": detail}
     else:
-        supplied = {name: load_pair(d[f"{name}_data_path"], d[f"{name}_label_path"])
+        supplied = {name: load_pair(d[f"{name}_data_path"], d[f"{name}_label_path"], cfg["model"]["architecture"] == "transformer" and cfg["model"]["length_aware"])
                     for name in ("train", "val", "test")}
         pieces, detail = manual_split(supplied["train"], supplied["val"], supplied["test"])
         manifest = {"mode": "manual", "seed": seed, "sources": {k: pair_meta(v) for k, v in supplied.items()}, "splits": detail}
@@ -228,8 +246,8 @@ def prepare_new_data(cfg: Mapping[str, Any], run: Path) -> Tuple[Dict[str, PairD
     return pieces, manifest, mapping
 
 
-def verify_source(meta: Mapping[str, Any]) -> PairData:
-    pair = load_pair(meta["data_path"], meta["label_path"])
+def verify_source(meta: Mapping[str, Any], length_aware: bool = False) -> PairData:
+    pair = load_pair(meta["data_path"], meta["label_path"], length_aware)
     if pair.data_checksum != meta["data_checksum_sha256"] or pair.label_checksum != meta["label_checksum_sha256"]:
         raise ValueError(f"source files changed since training: {meta['data_path']}")
     return pair
@@ -242,31 +260,38 @@ def subset_pair(pair: PairData, indices: Sequence[int]) -> PairData:
 
 def load_saved_splits(run: Path) -> Tuple[Dict[str, PairData], Dict[str, Any], Dict[str, int]]:
     manifest = json.loads((run / "split_manifest.json").read_text())
+    saved_cfg = validate_config(read_yaml(run / "config.yaml")); length_aware = saved_cfg["model"]["architecture"] == "transformer" and saved_cfg["model"]["length_aware"]
     mapping = {str(k): int(v) for k, v in json.loads((run / "label_mapping.json").read_text()).items()}
     pieces: Dict[str, PairData] = {}
     if manifest["mode"] == "auto":
-        source = verify_source(manifest["sources"]["source"])
+        source = verify_source(manifest["sources"]["source"], length_aware)
         for name in ("train", "val", "test"):
             pieces[name] = subset_pair(source, manifest["splits"][name]["source_indices"])
     else:
         for name in ("train", "val", "test"):
-            pieces[name] = verify_source(manifest["sources"][name])
+            pieces[name] = verify_source(manifest["sources"][name], length_aware)
     for name, pair in pieces.items():
         if list(pair.row_hashes) != manifest["splits"][name]["row_hashes"]:
             raise ValueError(f"saved {name} rows no longer match split manifest")
     return pieces, manifest, mapping
 
 
-def arrays(pair: PairData, mapping: Mapping[str, int]) -> Tuple[np.ndarray, np.ndarray]:
+def arrays(pair: PairData, mapping: Mapping[str, int], model: Mapping[str, Any], stats: Optional[Mapping[str, float]] = None) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
     unknown = sorted(set(pair.labels) - set(mapping))
     if unknown: raise ValueError(f"labels not present in checkpoint mapping: {unknown}")
-    return normalize_rows(pair.values)[:, None, :], np.asarray([mapping[x] for x in pair.labels], dtype=np.int64)
+    if model["architecture"] == "transformer" and model["length_aware"]:
+        if pair.lengths is None: raise ValueError("length-aware data has no lengths")
+        x, _, _ = normalize_length_aware(pair.values, pair.lengths, None if stats is None else stats["mean"], None if stats is None else stats["std"])
+        lengths = pair.lengths
+    else: x, lengths = normalize_rows(pair.values), None
+    return x[:, None, :], np.asarray([mapping[x] for x in pair.labels], dtype=np.int64), lengths
 
 
-def loader(pair: PairData, mapping: Mapping[str, int], batch: int, shuffle: bool,
+def loader(pair: PairData, mapping: Mapping[str, int], model: Mapping[str, Any], stats: Optional[Mapping[str, float]], batch: int, shuffle: bool,
            workers: int, seed: int) -> DataLoader:
-    x, y = arrays(pair, mapping)
-    return DataLoader(TensorDataset(torch.from_numpy(x), torch.from_numpy(y)), batch_size=batch,
+    x, y, lengths = arrays(pair, mapping, model, stats)
+    tensors = [torch.from_numpy(x), torch.from_numpy(y)] + ([] if lengths is None else [torch.from_numpy(lengths)])
+    return DataLoader(TensorDataset(*tensors), batch_size=batch,
                       shuffle=shuffle, num_workers=workers,
                       worker_init_fn=worker_seed if workers else None, persistent_workers=workers > 0)
 
@@ -276,10 +301,12 @@ def epoch_pass(model: nn.Module, dl: DataLoader, criterion: nn.Module, device: t
     model.train(optimizer is not None); total_loss = 0.0; truth = []; pred = []
     context = torch.enable_grad() if optimizer is not None else torch.no_grad()
     with context:
-        for x, y in dl:
+        for batch in dl:
+            x, y, *lengths = batch
             x, y = x.to(device), y.to(device)
+            lengths = lengths[0].to(device) if lengths else None
             if optimizer is not None: optimizer.zero_grad(set_to_none=True)
-            logits = model(x); loss = criterion(logits, y)
+            logits = model(x, lengths) if lengths is not None else model(x); loss = criterion(logits, y)
             if optimizer is not None: loss.backward(); optimizer.step()
             total_loss += float(loss.detach()) * len(y)
             truth.extend(y.detach().cpu().tolist()); pred.extend(logits.argmax(1).detach().cpu().tolist())
@@ -290,13 +317,13 @@ def epoch_pass(model: nn.Module, dl: DataLoader, criterion: nn.Module, device: t
 
 def checkpoint_payload(model: nn.Module, optimizer: torch.optim.Optimizer, scheduler: ReduceLROnPlateau,
                        completed: int, best_epoch: Optional[int], best: float, counter: int,
-                       cfg: Mapping[str, Any], mapping: Mapping[str, int], manifest: Mapping[str, Any]) -> Dict[str, Any]:
-    return {"format_version": 1, "saved_at": now(), "model_state": model.state_dict(),
+                       cfg: Mapping[str, Any], mapping: Mapping[str, int], manifest: Mapping[str, Any], preprocessing_stats: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
+    return {"format_version": CHECKPOINT_FORMAT_VERSION, "saved_at": now(), "model_state": model.state_dict(),
             "optimizer_state": optimizer.state_dict(), "scheduler_state": scheduler.state_dict(),
             "completed_epoch": completed, "best_epoch": best_epoch, "best_metric": best,
             "early_stopping_counter": counter, "model_config": cfg["model"],
-            "training_config": cfg["training"], "preprocessing_config": cfg["preprocessing"],
-            "label_mapping": dict(mapping), "split_information": manifest, "rng_states": rng_state()}
+            "training_config": cfg["training"], "preprocessing_config": cfg["preprocessing"], "preprocessing_stats": preprocessing_stats,
+            "length_aware": bool(cfg["model"].get("length_aware", False)), "label_mapping": dict(mapping), "split_information": manifest, "rng_states": rng_state()}
 
 
 def write_history(run: Path, history: Sequence[Mapping[str, Any]]) -> None:
@@ -321,7 +348,8 @@ def load_checkpoint(path: Path, device: torch.device) -> Dict[str, Any]:
                 "preprocessing_config", "label_mapping", "split_information", "rng_states"}
     missing = required - set(cp)
     if missing: raise ValueError(f"checkpoint is missing fields: {sorted(missing)}")
-    if cp["preprocessing_config"] != PREPROCESSING: raise ValueError("checkpoint preprocessing is incompatible")
+    if cp.get("format_version") != CHECKPOINT_FORMAT_VERSION: raise ValueError(f"unsupported checkpoint format_version {cp.get('format_version')}; expected {CHECKPOINT_FORMAT_VERSION}")
+    if "preprocessing_stats" not in cp: raise ValueError("checkpoint is missing preprocessing statistics")
     return cp
 
 
@@ -338,7 +366,12 @@ def train(run: Path, cfg: Dict[str, Any], resume_checkpoint: Optional[Path] = No
         with log.open("a") as f: f.write(f"{now()} {msg}\n")
     device = choose_device(cfg["training"]["device"]); seed_all(cfg["training"]["seed"])
     pieces, manifest, mapping = load_saved_splits(run)
-    tr = cfg["training"]; model = ResNet((1, 3000), len(mapping), cfg["model"]["initial_feature_maps"]).to(device)
+    tr = cfg["training"]
+    stats = None
+    if cfg["model"]["architecture"] == "transformer" and cfg["model"]["length_aware"]:
+        _, mean, std = normalize_length_aware(pieces["train"].values, pieces["train"].lengths)
+        stats = {"mean": mean, "std": std, "fit_split": "train", "valid_values_only": True}
+    model = make_model(cfg["model"], len(mapping)).to(device)
     count = sum(p.numel() for p in model.parameters()); (run / "parameter_count.txt").write_text(str(count) + "\n")
     opt_cls = Adam if tr["optimizer"].lower() == "adam" else AdamW
     optimizer = opt_cls(model.parameters(), lr=float(tr["learning_rate"]))
@@ -346,14 +379,14 @@ def train(run: Path, cfg: Dict[str, Any], resume_checkpoint: Optional[Path] = No
                                   patience=int(tr["scheduler"]["patience"]), min_lr=float(tr["scheduler"]["min_lr"]))
     weights = class_weights(pieces["train"].labels, mapping, device) if tr["class_imbalance"] == "weighted" else None
     criterion = nn.CrossEntropyLoss(weight=weights)
-    train_dl = loader(pieces["train"], mapping, tr["batch_size"], True, tr["num_workers"], tr["seed"])
-    val_dl = loader(pieces["val"], mapping, tr["batch_size"], False, tr["num_workers"], tr["seed"])
+    train_dl = loader(pieces["train"], mapping, cfg["model"], stats, tr["batch_size"], True, tr["num_workers"], tr["seed"])
+    val_dl = loader(pieces["val"], mapping, cfg["model"], stats, tr["batch_size"], False, tr["num_workers"], tr["seed"])
     history = json.loads((run / "metrics.json").read_text()) if (run / "metrics.json").exists() else []
     completed, best_epoch, best, counter = 0, None, float("inf"), 0
     if resume_checkpoint:
         cp = load_checkpoint(resume_checkpoint, device)
         if (cp["model_config"] != cfg["model"] or cp["preprocessing_config"] != cfg["preprocessing"]
-                or cp["label_mapping"] != mapping or cp["split_information"] != manifest):
+                or cp.get("preprocessing_stats") != stats or cp["label_mapping"] != mapping or cp["split_information"] != manifest):
             raise ValueError("resume rejected: model architecture, preprocessing, label mapping, or saved split changed")
         runtime_keys = {"max_epochs", "device", "num_workers"}
         incompatible_training = [key for key in cp["training_config"]
@@ -368,7 +401,7 @@ def train(run: Path, cfg: Dict[str, Any], resume_checkpoint: Optional[Path] = No
     ckdir = run / "checkpoints"; ckdir.mkdir(exist_ok=True)
     status_update(run, "running", cfg, completed_epochs=completed, parameter_count=count, stop_reason=None)
     say(f"Device: {device}; parameters: {count:,}; resuming after epoch {completed}")
-    initial_boundary = checkpoint_payload(model, optimizer, scheduler, completed, best_epoch, best, counter, cfg, mapping, manifest)
+    initial_boundary = checkpoint_payload(model, optimizer, scheduler, completed, best_epoch, best, counter, cfg, mapping, manifest, stats)
     initial_boundary_path = ckdir / ".initial_boundary.pt"
     atomic_torch_save(initial_boundary_path, initial_boundary)
     serialized_boundary_path = initial_boundary_path
@@ -389,7 +422,7 @@ def train(run: Path, cfg: Dict[str, Any], resume_checkpoint: Optional[Path] = No
                    "train_macro_f1": tm["macro_f1"], "val_macro_f1": vm["macro_f1"],
                    "learning_rate": optimizer.param_groups[0]["lr"], "duration_seconds": time.perf_counter() - started}
             history.append(row); write_history(run, history)
-            payload = checkpoint_payload(model, optimizer, scheduler, epoch, best_epoch, best, counter, cfg, mapping, manifest)
+            payload = checkpoint_payload(model, optimizer, scheduler, epoch, best_epoch, best, counter, cfg, mapping, manifest, stats)
             if raw_better: atomic_torch_save(ckdir / "best.pt", payload)
             atomic_torch_save(ckdir / "latest.pt", payload)
             serialized_boundary_path = ckdir / "latest.pt"
@@ -483,13 +516,19 @@ def evaluate_checkpoint(checkpoint: Path, original: bool, data_path: Optional[st
         kind = "original_test"
     else:
         if not data_path or not label_path: raise ValueError("external evaluation requires data and label paths")
-        pair = load_pair(data_path, label_path); kind = "external_test"
-    x, y = arrays(pair, mapping); dl = DataLoader(TensorDataset(torch.from_numpy(x), torch.from_numpy(y)), batch_size=cfg["training"]["batch_size"], shuffle=False, num_workers=cfg["training"]["num_workers"])
-    model = ResNet((1, 3000), len(mapping), cp["model_config"]["initial_feature_maps"]).to(device); model.load_state_dict(cp["model_state"]); model.eval()
+        pair = None; kind = "external_test"
+    if cp["model_config"] != cfg["model"] or cp["preprocessing_config"] != cfg["preprocessing"]: raise ValueError("checkpoint architecture or preprocessing differs from run configuration")
+    length_aware = cfg["model"]["architecture"] == "transformer" and cfg["model"].get("length_aware", False)
+    if not original: pair = load_pair(data_path, label_path, length_aware)
+    x, y, lengths = arrays(pair, mapping, cfg["model"], cp["preprocessing_stats"])
+    tensors = [torch.from_numpy(x), torch.from_numpy(y)] + ([] if lengths is None else [torch.from_numpy(lengths)])
+    dl = DataLoader(TensorDataset(*tensors), batch_size=cfg["training"]["batch_size"], shuffle=False, num_workers=cfg["training"]["num_workers"])
+    model = make_model(cp["model_config"], len(mapping)).to(device); model.load_state_dict(cp["model_state"]); model.eval()
     criterion = nn.CrossEntropyLoss(); total = 0.; truth = []; probs = []; started = time.perf_counter()
     with torch.no_grad():
-        for xb, yb in dl:
-            xb, yb = xb.to(device), yb.to(device); logits = model(xb)
+        for batch in dl:
+            xb, yb, *lengths = batch
+            xb, yb = xb.to(device), yb.to(device); logits = model(xb, lengths[0].to(device)) if lengths else model(xb)
             total += float(criterion(logits, yb)) * len(yb); truth.extend(yb.cpu().tolist()); probs.append(torch.softmax(logits, 1).cpu().numpy())
     duration = time.perf_counter() - started; probabilities = np.concatenate(probs); pred = probabilities.argmax(1)
     labels = [x for x, _ in sorted(mapping.items(), key=lambda z: z[1])]

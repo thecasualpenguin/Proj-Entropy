@@ -17,7 +17,7 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "src"))
-import linear_probe as probe
+import linear_probe_resnet as probe
 from model_resnet_tsc import ResNet
 from supervised_data import FEATURE_COLUMNS, automatic_split, load_pair
 
@@ -50,7 +50,7 @@ class LinearProbeTests(unittest.TestCase):
         model = ResNet((1, 3000), 3, 1)
         self.checkpoint = self.root / "run" / "checkpoints" / "best.pt"
         self.checkpoint.parent.mkdir(parents=True)
-        torch.save({"format_version": 1, "completed_epoch": 7, "model_state": model.state_dict(), "model_config": {"initial_feature_maps": 1},
+        torch.save({"format_version": 2, "completed_epoch": 7, "model_state": model.state_dict(), "model_config": {"architecture": "resnet", "initial_feature_maps": 1},
                     "preprocessing_config": probe.PREPROCESSING, "label_mapping": {"a": 0, "b": 1, "c": 2},
                     "split_information": self.manifest}, self.checkpoint)
 
@@ -119,11 +119,11 @@ class LinearProbeTests(unittest.TestCase):
 
     def test_malformed_checkpoint_version_labels_and_numeric_inputs(self):
         bad_version = self.root / "bad-version.pt"
-        raw = torch.load(self.checkpoint, weights_only=False); raw["format_version"] = 2; torch.save(raw, bad_version)
+        raw = torch.load(self.checkpoint, weights_only=False); raw["format_version"] = 3; torch.save(raw, bad_version)
         with self.assertRaisesRegex(ValueError, "format_version"):
             probe._load_checkpoint(bad_version, torch.device("cpu"))
         bad_labels = self.root / "bad-labels.pt"
-        raw["format_version"] = 1; raw["label_mapping"] = {"a": 0, "b": 2}; torch.save(raw, bad_labels)
+        raw["format_version"] = 2; raw["label_mapping"] = {"a": 0, "b": 2}; torch.save(raw, bad_labels)
         with self.assertRaisesRegex(ValueError, "contiguous"):
             probe._load_checkpoint(bad_labels, torch.device("cpu"))
         for c_values, max_iter in (((float("nan"),), 1), ((0,), 1), ((1,), 0)):

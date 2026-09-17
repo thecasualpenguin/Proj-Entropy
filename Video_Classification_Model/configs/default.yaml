@@ -1,29 +1,30 @@
-# Validated defaults for the supervised PyTorch 1-D ResNet pipeline.
+# Validated defaults. ResNet remains the default architecture.
 run:
   output_root: runs
-  name: null                 # CLI --run-name, or a generated timestamp when null
-
+  name: null
 data:
-  mode: auto                 # auto or manual
-  data_path: null            # auto: CSV containing size0..size2999
+  mode: auto
+  data_path: null
   label_path: null
-  train_data_path: null      # manual mode
+  train_data_path: null
   train_label_path: null
   val_data_path: null
   val_label_path: null
   test_data_path: null
   test_label_path: null
-
 model:
+  architecture: resnet
   initial_feature_maps: 128
-
+  # For architecture: transformer, replace initial_feature_maps with:
+  # patch_size: 16, d_model: 32, nhead: 4, num_layers: 2,
+  # dim_feedforward: 64, dropout: 0.2, length_aware: true
 training:
   seed: 42
   learning_rate: 0.001
   batch_size: 64
   max_epochs: 300
-  optimizer: Adam            # Adam or AdamW
-  class_imbalance: none      # none or weighted
+  optimizer: Adam
+  class_imbalance: none
   early_stopping:
     monitor: validation_loss
     patience: 25
@@ -33,11 +34,10 @@ training:
     patience: 10
     min_lr: 0.00001
   checkpoint_frequency: 1
-  device: auto               # auto, cpu, cuda, cuda:N, or mps
+  device: auto
   num_workers: 0
-
 preprocessing:
   method: per_sequence_zscore
   sequence_length: 3000
   standard_deviation: population
-  epsilon: null              # zero-variance rows are rejected; no epsilon is applied
+  epsilon: null

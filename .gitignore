@@ -175,3 +175,4 @@ cython_debug/
 /Video_Classification_Model/1-dataset
 /Video_Classification_Model/runs
 /.DS_Store
+/Video_Classification_Model/extracted_frames

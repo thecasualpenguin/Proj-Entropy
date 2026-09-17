@@ -14,6 +14,7 @@ data:
   test_data_path: null
   test_label_path: null
 model:
+  architecture: resnet
   initial_feature_maps: 128
 training:
   seed: 42

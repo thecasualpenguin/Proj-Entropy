@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Frozen linear probes for residual blocks in a modern supervised run.
 
-The probe consumes a ``run_pipeline.py`` format-version-1 checkpoint and its
+The probe consumes a ``run_pipeline.py`` format-version-2 checkpoint and its
 recorded split manifest.  It never trains or changes the encoder.
 """
 from __future__ import annotations
@@ -33,11 +33,10 @@ from torch.utils.data import DataLoader, TensorDataset
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE / "src"))
 from model_resnet_tsc import ResNet
-from run_pipeline import choose_device
+from run_pipeline import choose_device, RESNET_PREPROCESSING
 from supervised_data import PairData, load_pair, normalize_rows
 
-PREPROCESSING = {"method": "per_sequence_zscore", "sequence_length": 3000,
-                 "standard_deviation": "population", "epsilon": None}
+PREPROCESSING = RESNET_PREPROCESSING
 BLOCKS = (1, 2, 3)
 
 
@@ -57,8 +56,10 @@ def _load_checkpoint(path: Path, device: torch.device) -> dict[str, Any]:
     missing = required - set(checkpoint)
     if missing:
         raise ValueError(f"checkpoint is not a modern supervised checkpoint; missing fields: {sorted(missing)}")
-    if checkpoint.get("format_version") != 1:
-        raise ValueError("checkpoint format_version must be 1")
+    if checkpoint.get("format_version") != 2:
+        raise ValueError("checkpoint format_version must be 2")
+    if checkpoint.get("model_config", {}).get("architecture") != "resnet":
+        raise ValueError("linear_probe_resnet only supports ResNet checkpoints; transformer checkpoints are not probeable")
     mapping = checkpoint["label_mapping"]
     if not isinstance(mapping, Mapping) or not mapping:
         raise ValueError("checkpoint label mapping must be a non-empty mapping")
@@ -165,6 +166,8 @@ def _validate_split_integrity(pieces: Mapping[str, PairData], manifest: Mapping[
 
 
 def reconstruct_encoder(checkpoint: Mapping[str, Any], device: torch.device) -> ResNet:
+    if checkpoint.get("model_config", {}).get("architecture") != "resnet":
+        raise ValueError("linear_probe_resnet only supports ResNet checkpoints; transformer checkpoints are not probeable")
     mapping = checkpoint["label_mapping"]
     model = ResNet((1, 3000), len(mapping), checkpoint["model_config"]["initial_feature_maps"]).to(device)
     model.load_state_dict(checkpoint["model_state"])
@@ -202,8 +205,10 @@ def _labels(pair: PairData, mapping: Mapping[str, int]) -> np.ndarray:
 
 def _fit_probe(x: np.ndarray, y: np.ndarray, c: float, max_iter: int) -> tuple[StandardScaler, LogisticRegression, list[str]]:
     scaler = StandardScaler().fit(x)
-    probe = LogisticRegression(C=c, solver="lbfgs", multi_class="multinomial", class_weight=None,
-                               max_iter=max_iter)
+    # Modern scikit-learn applies multinomial fitting automatically for a
+    # multiclass lbfgs problem; omitting the removed multi_class argument keeps
+    # this declared, unpinned dependency compatible across supported releases.
+    probe = LogisticRegression(C=c, solver="lbfgs", class_weight=None, max_iter=max_iter)
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always", ConvergenceWarning)
         probe.fit(scaler.transform(x), y)

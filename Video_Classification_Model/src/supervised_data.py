@@ -24,12 +24,13 @@ class PairData:
     label_path: Path
     data_checksum: str
     label_checksum: str
+    lengths: np.ndarray | None = None
 
     def subset(self, indices: Sequence[int]) -> "PairData":
         idx = np.asarray(indices, dtype=np.int64)
         return PairData(self.values[idx], self.labels[idx], self.source_indices[idx],
                         tuple(self.row_hashes[i] for i in idx), self.data_path, self.label_path,
-                        self.data_checksum, self.label_checksum)
+                        self.data_checksum, self.label_checksum, None if self.lengths is None else self.lengths[idx])
 
 
 def file_sha256(path: str | Path) -> str:
@@ -55,7 +56,18 @@ def row_sha256(row: np.ndarray) -> str:
     return sha256(np.ascontiguousarray(values).tobytes()).hexdigest()
 
 
-def load_pair(data_csv: str | Path, label_csv: str | Path) -> PairData:
+def infer_lengths(values: np.ndarray) -> np.ndarray:
+    """Return contiguous nonzero-prefix lengths, rejecting holes and empty rows."""
+    x = np.asarray(values)
+    nonzero = x != 0
+    lengths = nonzero.sum(axis=1).astype(np.int64)
+    if np.any(lengths == 0): raise ValueError("length-aware sequences must contain at least one nonzero packet")
+    expected = np.arange(x.shape[1])[None, :] < lengths[:, None]
+    if not np.array_equal(nonzero, expected): raise ValueError("length-aware sequences require a contiguous nonzero prefix (zero followed by nonzero found)")
+    return lengths
+
+
+def load_pair(data_csv: str | Path, label_csv: str | Path, length_aware: bool = False) -> PairData:
     """Load one pair without deduplicating it; splitting decides duplicate policy."""
     data_path, label_path = Path(data_csv).expanduser().resolve(), Path(label_csv).expanduser().resolve()
     frame = pd.read_csv(data_path)
@@ -70,8 +82,10 @@ def load_pair(data_csv: str | Path, label_csv: str | Path) -> PairData:
     values = frame.to_numpy(dtype=np.float64, copy=True)
     if not np.isfinite(values).all(): raise ValueError("packet sizes must be finite and missing values are forbidden")
     if (values < 0).any(): raise ValueError("packet sizes must be nonnegative")
-    zero = np.flatnonzero(values.std(axis=1, ddof=0) == 0)
-    if len(zero): raise ValueError(f"zero-standard-deviation sequence at data row {int(zero[0])}")
+    lengths = infer_lengths(values) if length_aware else None
+    if not length_aware:
+        zero = np.flatnonzero(values.std(axis=1, ddof=0) == 0)
+        if len(zero): raise ValueError(f"zero-standard-deviation sequence at data row {int(zero[0])}")
     labels_frame = pd.read_csv(label_path)
     if labels_frame.shape[1] != 1: raise ValueError("label CSV must contain exactly one column")
     if len(labels_frame) != len(values):
@@ -79,7 +93,19 @@ def load_pair(data_csv: str | Path, label_csv: str | Path) -> PairData:
     labels = np.asarray([canonicalize_label(v) for v in labels_frame.iloc[:, 0]], dtype=object)
     hashes = tuple(row_sha256(row) for row in values)
     return PairData(values, labels, np.arange(len(values), dtype=np.int64), hashes,
-                    data_path, label_path, file_sha256(data_path), file_sha256(label_path))
+                    data_path, label_path, file_sha256(data_path), file_sha256(label_path), lengths)
+
+
+def normalize_length_aware(values: np.ndarray, lengths: np.ndarray, mean: float | None = None, std: float | None = None) -> tuple[np.ndarray, float, float]:
+    """Fit/apply a scalar z-score over real prefix values only and retain zero padding."""
+    x = np.asarray(values, dtype=np.float64); lengths = np.asarray(lengths, dtype=np.int64)
+    valid = np.arange(x.shape[1])[None, :] < lengths[:, None]
+    real = x[valid]
+    if mean is None: mean = float(real.mean())
+    if std is None: std = float(real.std(ddof=0))
+    if not np.isfinite(mean) or not np.isfinite(std) or std == 0: raise ValueError("length-aware training values require nonzero finite global standard deviation")
+    out = ((x - mean) / std).astype(np.float32); out[~valid] = 0
+    return out, float(mean), float(std)
 
 
 def normalize_rows(values: np.ndarray) -> np.ndarray:
