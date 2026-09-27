@@ -134,8 +134,12 @@ class LinearProbeTests(unittest.TestCase):
         # This is a parent-run final-test artifact: it is a display-only reference,
         # not an input to the selection fits below.
         reference = {"evaluation_kind": "original_test", "checkpoint": str(self.checkpoint.resolve()),
-                     "accuracy": .8, "balanced_accuracy": .75, "macro_f1": .7, "test_loss": 1.2}
-        (self.checkpoint.parent.parent / "test_metrics.json").write_text(json.dumps(reference))
+                     "accuracy": .8, "macro_precision": .75, "macro_f1": .7, "test_loss": 1.2}
+        summary = self.checkpoint.parent.parent / "evaluations" / "summarized_metrics.json"
+        summary.parent.mkdir()
+        summary.write_text(json.dumps(reference))
+        # A legacy file must not win when the current summary is present.
+        (self.checkpoint.parent.parent / "test_metrics.json").write_text("not used")
         def fake_features(_model, pair, _device, _batch):
             # All blocks have separable train/validation features.  The test
             # labels are intentionally irrelevant to C selection.
@@ -152,6 +156,9 @@ class LinearProbeTests(unittest.TestCase):
              mock.patch.object(probe, "extract_block_features", side_effect=fake_features), \
              mock.patch.object(probe, "_fit_probe", side_effect=observing_fit):
             out = probe.run_linear_probe(self.checkpoint, c_values=(1.0, 0.1), output_root=self.root / "artifacts")
+            rerun = probe.run_linear_probe(self.checkpoint, c_values=(1.0, 0.1), output_root=self.root / "artifacts")
+        self.assertEqual(out, self.root / "artifacts")  # No timestamped probe subdirectory.
+        self.assertEqual(rerun, out)  # Current artifact names are overwritten in place.
         # The six selection fits use training features only; the three later
         # fits are the explicitly permitted train+validation refits.
         train_count = len(automatic_split(load_pair(self.data, self.labels), seed=4)[0]["train"].labels)
@@ -160,24 +167,33 @@ class LinearProbeTests(unittest.TestCase):
         self.assertEqual(len(rows), 6)
         for row in rows:
             for split in ("train", "validation"):
-                for metric in ("accuracy", "macro_f1", "multinomial_log_loss"):
+                for metric in (*probe.CLASSIFICATION_METRICS, "multinomial_log_loss"):
                     self.assertIn(f"{split}_{metric}", row)
                     self.assertTrue(np.isfinite(row[f"{split}_{metric}"]))
+            self.assertEqual(row["stage"], "candidate_train_fit_validation_selection")
         for block in (1, 2, 3):
             metrics = json.loads((out / f"block{block}" / "final_metrics.json").read_text())
             self.assertEqual(metrics["selected_C"], .1)  # smaller C breaks tied validation F1
             self.assertIn("multinomial_log_loss", metrics)
             self.assertTrue(np.isfinite(metrics["multinomial_log_loss"]))
+            self.assertEqual(metrics["stage"], "final_train_validation_refit_test")
+            self.assertTrue(set(probe.CLASSIFICATION_METRICS) <= set(metrics))
             self.assertTrue((out / f"block{block}" / "scaler.joblib").exists())
             self.assertTrue((out / f"block{block}" / "confusion_matrix_raw.csv").exists())
-        for name in ("selection_accuracy_vs_C.png", "selection_macro_f1_vs_C.png",
-                     "selection_log_loss_vs_C.png", "final_test_metrics_by_block.png"):
+        for name in ("selection_accuracy_vs_C.png", "selection_precision_vs_C.png",
+                     "selection_recall_vs_C.png", "selection_f1_vs_C.png",
+                     "selection_log_loss_vs_C.png", "final_test_metrics_by_block.png", "summarized_metrics.json"):
             self.assertTrue((out / name).is_file(), name)
         metadata = json.loads((out / "metadata.json").read_text())
         saved_reference = metadata["original_resnet_test_reference"]
         self.assertEqual(saved_reference["status"], "available")
         self.assertEqual(saved_reference["values"]["multinomial_log_loss"], 1.2)
         self.assertEqual(saved_reference["source_keys"]["multinomial_log_loss"], "test_loss")
+        probe_summary = json.loads((out / "summarized_metrics.json").read_text())
+        selected = probe_summary["blocks"]["block1"]
+        self.assertEqual(selected["selected_C"], .1)
+        self.assertEqual(selected["candidate_pre_refit"]["classification_metric_maxima"]["validation"]["macro_f1"]["C"], .1)
+        self.assertIn("multinomial_log_loss_minima", selected["candidate_pre_refit"])
 
     def test_log_loss_uses_full_label_order_and_reference_failures_are_safe(self):
         class FakeProbe:
@@ -199,7 +215,8 @@ class LinearProbeTests(unittest.TestCase):
         partial = probe._load_original_test_reference(self.checkpoint.resolve())
         self.assertEqual(partial["status"], "available")
         self.assertEqual(partial["values"], {"accuracy": .5})
-        self.assertEqual(set(partial["omitted_metrics"]), {"balanced_accuracy", "macro_f1", "multinomial_log_loss"})
+        self.assertEqual(set(partial["omitted_metrics"]),
+                         set(probe.CLASSIFICATION_METRICS) - {"accuracy"} | {"multinomial_log_loss"})
 
     def test_reference_accepts_strict_run_relative_relocation_and_rejects_mismatches(self):
         cp = probe._load_checkpoint(self.checkpoint, torch.device("cpu"))
@@ -240,9 +257,11 @@ class LinearProbeTests(unittest.TestCase):
         values = torch.from_numpy(probe.normalize_rows(pair.values)[:, None, :])
         with torch.inference_mode():
             one = model.layer1(values); two = model.layer2(one); three = model.layer3(two)
-        np.testing.assert_allclose(features[1], one.mean(2).numpy())
-        np.testing.assert_allclose(features[2], two.mean(2).numpy())
-        np.testing.assert_allclose(features[3], model.gap(three).flatten(1).numpy())
+        # Convolution/reduction order differs slightly between batched feature
+        # extraction and the one-shot reference on some CPU/CUDA builds.
+        np.testing.assert_allclose(features[1], one.mean(2).numpy(), rtol=1e-5, atol=1e-7)
+        np.testing.assert_allclose(features[2], two.mean(2).numpy(), rtol=1e-5, atol=1e-7)
+        np.testing.assert_allclose(features[3], model.gap(three).flatten(1).numpy(), rtol=1e-5, atol=1e-7)
 
     def test_encoder_is_frozen_and_block_three_matches_gap(self):
         cp = probe._load_checkpoint(self.checkpoint, torch.device("cpu"))

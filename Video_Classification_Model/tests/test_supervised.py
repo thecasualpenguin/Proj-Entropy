@@ -83,19 +83,43 @@ class DataContractTests(unittest.TestCase):
 
 
 class MetricsAndLifecycleTests(unittest.TestCase):
-    def test_metrics_top3_confusions_and_zero_division(self):
-        truth = [0, 1, 2, 2]; pred = [0, 0, 0, 0]
-        probs = np.asarray([[.8,.1,.1], [.7,.2,.1], [.6,.2,.2], [.6,.1,.3]])
-        metrics, per_class, raw, norm = app.evaluation_metrics(truth, pred, probs, ["a","b","c"], .5, 2., 99)
+    def test_metrics_class_coverage_and_zero_division(self):
+        # Predictions into absent configured classes remain errors, while macro
+        # and weighted aggregates average only the ground-truth-present class.
+        truth = [0, 0]; pred = [2, 2]
+        probs = np.asarray([[.1, .1, .8], [.1, .1, .8]])
+        metrics, per_class, raw, norm = app.evaluation_metrics(truth, pred, probs, ["a", "b", "c"], .5, 2., 99)
         self.assertEqual(metrics["parameter_count"], 99)
         self.assertTrue(metrics["zero_division_handling"]["occurred"])
-        self.assertEqual(raw.shape, (3,3)); self.assertEqual(norm.shape, (3,3))
-        self.assertEqual(len(per_class), 3); self.assertEqual(metrics["top_3_accuracy"], 1.0)
+        self.assertEqual(raw.shape, (3, 3)); self.assertEqual(norm.shape, (3, 3))
+        self.assertEqual(len(per_class), 3)
+        self.assertEqual(metrics["class_coverage"]["absent_classes"], ["b", "c"])
+        self.assertEqual(metrics["accuracy"], 0.0)
+        for key in ("macro_precision", "weighted_precision", "macro_recall", "weighted_recall", "macro_f1", "weighted_f1"):
+            self.assertEqual(metrics[key], 0.0)
+        self.assertNotIn("top_3_accuracy", metrics)
+        self.assertNotIn("balanced_accuracy", metrics)
 
     def test_checkpoint_validation(self):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "bad.pt"; torch.save({"model_state": {}}, path)
             with self.assertRaisesRegex(ValueError, "missing fields"): app.load_checkpoint(path, torch.device("cpu"))
+
+    def test_partial_legacy_history_preserves_known_best_metrics_without_inventing_others(self):
+        existing = {"train": {"macro_f1": {"value": .9, "epoch": 3}},
+                    "validation": {"weighted_f1": {"value": .8, "epoch": 2}}}
+        partial = [{"epoch": 4, "train_accuracy": .6, "validation_accuracy": .7},
+                   {"epoch": 1, "train_accuracy": .6, "validation_accuracy": .5}]
+        merged = app.preserve_best_observed(existing, app.best_observed_history(partial))
+        self.assertEqual(merged["train"]["macro_f1"], {"value": .9, "epoch": 3})
+        self.assertEqual(merged["validation"]["weighted_f1"], {"value": .8, "epoch": 2})
+        self.assertEqual(merged["train"]["accuracy"], {"value": .6, "epoch": 1})
+        self.assertEqual(merged["validation"]["accuracy"], {"value": .7, "epoch": 4})
+        self.assertNotIn("weighted_precision", merged["train"])
+        with tempfile.TemporaryDirectory() as td:
+            run = Path(td)
+            (run / "metrics.json").write_text(json.dumps(partial))
+            self.assertEqual(app.saved_history_for_summary(run), partial)
 
     def test_interruption_resume_increase_and_repeat_original_evaluation(self):
         with tempfile.TemporaryDirectory() as td:
@@ -114,14 +138,45 @@ class MetricsAndLifecycleTests(unittest.TestCase):
 
             candidate = copy.deepcopy(cfg); candidate["training"]["max_epochs"] = 2
             resume_yaml = root / "resume.yaml"; resume_yaml.write_text(yaml.safe_dump(candidate, sort_keys=False))
-            fake = {"loss": .5, "accuracy": .5, "macro_precision": .5, "macro_recall": .5, "macro_f1": .5}
+            fake = {"loss": .5, **{metric: .5 for metric in app.CLASSIFICATION_METRICS}}
             with mock.patch.object(app, "epoch_pass", return_value=fake), mock.patch.object(app, "evaluate_checkpoint"):
                 app.resume(run, resume_yaml, None)
             self.assertEqual(json.loads((run / "status.json").read_text())["completed_epochs"], 2)
             self.assertTrue((run / "checkpoints" / "best.pt").exists())
             first = app.evaluate_checkpoint(run / "checkpoints" / "best.pt", True, device_spec="cpu")
             second = app.evaluate_checkpoint(run / "checkpoints" / "best.pt", True, device_spec="cpu")
-            self.assertNotEqual(first, second); self.assertTrue((first / "metrics.json").exists()); self.assertTrue((second / "metrics.json").exists())
+            expected = {"per_epoch_metrics.csv", "per_epoch_metrics.json", "summarized_metrics.json",
+                        "accuracy_curves.png", "loss_curves.png", "precision_curves.png", "recall_curves.png", "f1_curves.png",
+                        "test_confusion_matrix_normalized.csv", "test_confusion_matrix_normalized.png",
+                        "test_confusion_matrix_raw.csv", "test_confusion_matrix_raw.png",
+                        "test_per_class_metrics.csv", "test_per_class_metrics.json"}
+            self.assertEqual(first, run / "evaluations")
+            self.assertEqual(second, first)
+            self.assertTrue(expected <= {path.name for path in first.iterdir()})
+            self.assertFalse((run / "metrics.json").exists())
+            self.assertFalse((run / "test_metrics.json").exists())
+            history = json.loads((first / "per_epoch_metrics.json").read_text())
+            self.assertTrue(all(f"{split}_{metric}" in history[0]
+                                for split in ("train", "validation")
+                                for metric in app.CLASSIFICATION_METRICS))
+            summary = json.loads((first / "summarized_metrics.json").read_text())
+            maxima = summary["best_observed_per_epoch_metrics"]
+            self.assertEqual(maxima["train"]["accuracy"], {"value": .5, "epoch": 1})
+            self.assertEqual(maxima["validation"]["weighted_f1"], {"value": .5, "epoch": 1})
+
+            # A standalone original-test evaluation with unavailable history
+            # must retain the already summarized best-observed section.
+            before_standalone = json.loads((first / "summarized_metrics.json").read_text())["best_observed_per_epoch_metrics"]
+            (first / "per_epoch_metrics.json").unlink()
+            app.evaluate_checkpoint(run / "checkpoints" / "best.pt", True, device_spec="cpu")
+            after_standalone = json.loads((first / "summarized_metrics.json").read_text())["best_observed_per_epoch_metrics"]
+            self.assertEqual(after_standalone, before_standalone)
+
+            original_summary = (first / "summarized_metrics.json").read_text()
+            other = app.evaluate_checkpoint(run / "checkpoints" / "best.pt", False, str(data), str(labels), "cpu")
+            self.assertEqual(other, first / "external_test")
+            self.assertTrue((other / "summarized_metrics.json").exists())
+            self.assertEqual((first / "summarized_metrics.json").read_text(), original_summary)
 
 
 if __name__ == "__main__": unittest.main()

@@ -12,6 +12,7 @@ import shutil
 import sys
 import time
 import traceback
+import warnings
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,15 +25,16 @@ import numpy as np
 import torch
 import torch.nn as nn
 import yaml
-from sklearn.metrics import (accuracy_score, balanced_accuracy_score,
-                             confusion_matrix, precision_recall_fscore_support,
-                             precision_score, recall_score, f1_score)
+from sklearn.metrics import confusion_matrix
 from torch.optim import Adam, AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader, TensorDataset
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE / "src"))
+from classification_metrics import (CLASSIFICATION_METRICS, class_coverage,
+                                    classification_scores, coverage_warnings,
+                                    per_class_scores, zero_division_details)
 from model_factory import make_model, validate_model_config
 from supervised_data import (PairData, automatic_split, load_pair,
                              manual_split, normalize_length_aware, normalize_rows)
@@ -225,6 +227,18 @@ def pair_meta(pair: PairData) -> Dict[str, Any]:
             "row_count": len(pair.labels)}
 
 
+def report_split_coverage(pieces: Mapping[str, PairData], mapping: Mapping[str, int]) -> Dict[str, Any]:
+    """Record coverage and warn without changing the saved splits."""
+    classes = [name for name, _ in sorted(mapping.items(), key=lambda item: item[1])]
+    coverage = {"train": class_coverage(pieces["train"].labels, classes),
+                "validation": class_coverage(pieces["val"].labels, classes),
+                "test": class_coverage(pieces["test"].labels, classes)}
+    messages = coverage_warnings(coverage)
+    for message in messages:
+        warnings.warn(message, RuntimeWarning, stacklevel=2)
+    return {"splits": coverage, "warnings": messages}
+
+
 def prepare_new_data(cfg: Mapping[str, Any], run: Path) -> Tuple[Dict[str, PairData], Dict[str, Any], Dict[str, int]]:
     d, seed = cfg["data"], cfg["training"]["seed"]
     if d["mode"] == "auto":
@@ -240,6 +254,7 @@ def prepare_new_data(cfg: Mapping[str, Any], run: Path) -> Tuple[Dict[str, PairD
     mapping = label_mapping(pieces["train"].labels)
     for name, pair in pieces.items():
         manifest["splits"][name]["class_distribution"] = dict(sorted(Counter(pair.labels).items()))
+    manifest["class_coverage"] = report_split_coverage(pieces, mapping)
     atomic_json(run / "split_manifest.json", manifest)
     atomic_json(run / "input_checksums.json", manifest["sources"])
     atomic_json(run / "label_mapping.json", mapping)
@@ -310,9 +325,7 @@ def epoch_pass(model: nn.Module, dl: DataLoader, criterion: nn.Module, device: t
             if optimizer is not None: loss.backward(); optimizer.step()
             total_loss += float(loss.detach()) * len(y)
             truth.extend(y.detach().cpu().tolist()); pred.extend(logits.argmax(1).detach().cpu().tolist())
-    p, r, f, _ = precision_recall_fscore_support(truth, pred, average="macro", zero_division=0)
-    return {"loss": total_loss / len(dl.dataset), "accuracy": accuracy_score(truth, pred),
-            "macro_precision": p, "macro_recall": r, "macro_f1": f}
+    return {"loss": total_loss / len(dl.dataset), **classification_scores(truth, pred)}
 
 
 def checkpoint_payload(model: nn.Module, optimizer: torch.optim.Optimizer, scheduler: ReduceLROnPlateau,
@@ -326,20 +339,110 @@ def checkpoint_payload(model: nn.Module, optimizer: torch.optim.Optimizer, sched
             "length_aware": bool(cfg["model"].get("length_aware", False)), "label_mapping": dict(mapping), "split_information": manifest, "rng_states": rng_state()}
 
 
+def evaluation_root(run: Path) -> Path:
+    """Return the shared, non-timestamped artifact directory for a run."""
+    return run / "evaluations"
+
+
+def history_path(run: Path) -> Path:
+    return evaluation_root(run) / "per_epoch_metrics.json"
+
+
+def _summary(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        value = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return dict(value) if isinstance(value, Mapping) else {}
+
+
+def best_observed_history(history: Sequence[Mapping[str, Any]]) -> Dict[str, Dict[str, Dict[str, float | int]]]:
+    """Independently maximize every available split/metric, keeping first ties."""
+    result: Dict[str, Dict[str, Dict[str, float | int]]] = {"train": {}, "validation": {}}
+    for split in result:
+        for metric in CLASSIFICATION_METRICS:
+            key = f"{split}_{metric}"
+            for row in history:
+                value = row.get(key)
+                epoch = row.get("epoch")
+                if (isinstance(value, (int, float)) and not isinstance(value, bool) and np.isfinite(value)
+                        and isinstance(epoch, int) and not isinstance(epoch, bool)):
+                    if (metric not in result[split] or value > result[split][metric]["value"]
+                            or (value == result[split][metric]["value"] and epoch < result[split][metric]["epoch"])):
+                        result[split][metric] = {"value": float(value), "epoch": epoch}
+    return {split: values for split, values in result.items() if values}
+
+
+def saved_history_for_summary(run: Path) -> list[Mapping[str, Any]]:
+    """Read current history, with a read-only fallback for pre-layout runs."""
+    path = history_path(run)
+    if not path.exists():
+        path = run / "metrics.json"
+    try:
+        value = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return []
+    return [row for row in value if isinstance(row, Mapping)] if isinstance(value, list) else []
+
+
+def _best_entry(value: Any) -> Optional[Dict[str, float | int]]:
+    if not isinstance(value, Mapping):
+        return None
+    score, epoch = value.get("value"), value.get("epoch")
+    if (isinstance(score, (int, float)) and not isinstance(score, bool) and np.isfinite(score)
+            and isinstance(epoch, int) and not isinstance(epoch, bool)):
+        return {"value": float(score), "epoch": epoch}
+    return None
+
+
+def preserve_best_observed(existing: Any, observed: Mapping[str, Mapping[str, Mapping[str, Any]]]) -> Dict[str, Any]:
+    """Merge available history maxima without deleting unknown legacy metrics."""
+    merged = copy.deepcopy(existing) if isinstance(existing, Mapping) else {}
+    for split, metrics in observed.items():
+        target = merged.setdefault(split, {})
+        if not isinstance(target, dict):
+            target = merged[split] = {}
+        for metric, candidate in metrics.items():
+            incoming, saved = _best_entry(candidate), _best_entry(target.get(metric))
+            if incoming is None:
+                continue
+            if saved is None or incoming["value"] > saved["value"] or (incoming["value"] == saved["value"] and incoming["epoch"] < saved["epoch"]):
+                target[metric] = incoming
+    return merged
+
+
 def write_history(run: Path, history: Sequence[Mapping[str, Any]]) -> None:
-    atomic_json(run / "metrics.json", list(history))
+    out = evaluation_root(run); out.mkdir(parents=True, exist_ok=True)
+    atomic_json(history_path(run), list(history))
+    summary_path = out / "summarized_metrics.json"
+    summary = _summary(summary_path)
+    maxima = best_observed_history(history)
+    preserved = preserve_best_observed(summary.get("best_observed_per_epoch_metrics"), maxima)
+    if preserved:  # Do not invent a metric section for unavailable legacy history.
+        summary["best_observed_per_epoch_metrics"] = preserved
+    atomic_json(summary_path, summary)
     if history:
-        tmp = run / "metrics.csv.tmp"
+        tmp = out / "per_epoch_metrics.csv.tmp"
         with tmp.open("w", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=list(history[0])); w.writeheader(); w.writerows(history)
-        os.replace(tmp, run / "metrics.csv")
-        for stem, keys, ylabel in (("loss_curves", ("train_loss", "val_loss"), "loss"),
-                                   ("accuracy_curves", ("train_accuracy", "val_accuracy"), "accuracy"),
-                                   ("macro_f1_curves", ("train_macro_f1", "val_macro_f1"), "macro F1")):
+            fieldnames = list(dict.fromkeys(key for row in history for key in row))
+            w = csv.DictWriter(f, fieldnames=fieldnames); w.writeheader(); w.writerows(history)
+        os.replace(tmp, out / "per_epoch_metrics.csv")
+        plot_specs = (("loss_curves", ("train_loss", "validation_loss"), "loss"),
+                      ("accuracy_curves", ("train_accuracy", "validation_accuracy"), "accuracy"),
+                      ("precision_curves", ("train_macro_precision", "train_weighted_precision", "validation_macro_precision", "validation_weighted_precision"), "precision"),
+                      ("recall_curves", ("train_macro_recall", "train_weighted_recall", "validation_macro_recall", "validation_weighted_recall"), "recall"),
+                      ("f1_curves", ("train_macro_f1", "train_weighted_f1", "validation_macro_f1", "validation_weighted_f1"), "F1"))
+        for stem, keys, ylabel in plot_specs:
+            if not all(any(key in row for row in history) for key in keys):
+                continue
             plt.figure()
-            for key in keys: plt.plot([x[key] for x in history], label=key)
+            for key in keys:
+                points = [(row["epoch"], row[key]) for row in history if key in row]
+                plt.plot(*zip(*points), label=key)
             plt.xlabel("epoch"); plt.ylabel(ylabel); plt.legend(); plt.tight_layout()
-            plt.savefig(run / f"{stem}.png", dpi=140); plt.close()
+            plt.savefig(out / f"{stem}.png", dpi=140); plt.close()
 
 
 def load_checkpoint(path: Path, device: torch.device) -> Dict[str, Any]:
@@ -366,6 +469,9 @@ def train(run: Path, cfg: Dict[str, Any], resume_checkpoint: Optional[Path] = No
         with log.open("a") as f: f.write(f"{now()} {msg}\n")
     device = choose_device(cfg["training"]["device"]); seed_all(cfg["training"]["seed"])
     pieces, manifest, mapping = load_saved_splits(run)
+    # Repeat coverage warnings when resuming an older run whose manifest did
+    # not yet contain the report; splits themselves are never altered.
+    report_split_coverage(pieces, mapping)
     tr = cfg["training"]
     stats = None
     if cfg["model"]["architecture"] == "transformer" and cfg["model"]["length_aware"]:
@@ -381,7 +487,11 @@ def train(run: Path, cfg: Dict[str, Any], resume_checkpoint: Optional[Path] = No
     criterion = nn.CrossEntropyLoss(weight=weights)
     train_dl = loader(pieces["train"], mapping, cfg["model"], stats, tr["batch_size"], True, tr["num_workers"], tr["seed"])
     val_dl = loader(pieces["val"], mapping, cfg["model"], stats, tr["batch_size"], False, tr["num_workers"], tr["seed"])
-    history = json.loads((run / "metrics.json").read_text()) if (run / "metrics.json").exists() else []
+    # Prefer the current layout; the root-level file is only a read fallback
+    # for resuming runs produced by older versions.
+    saved_history = history_path(run)
+    if not saved_history.exists(): saved_history = run / "metrics.json"
+    history = json.loads(saved_history.read_text()) if saved_history.exists() else []
     completed, best_epoch, best, counter = 0, None, float("inf"), 0
     if resume_checkpoint:
         cp = load_checkpoint(resume_checkpoint, device)
@@ -417,9 +527,9 @@ def train(run: Path, cfg: Dict[str, Any], resume_checkpoint: Optional[Path] = No
             significant = vm["loss"] < previous_best - float(tr["early_stopping"]["min_improvement"])
             if raw_better: best, best_epoch = vm["loss"], epoch
             counter = 0 if significant else counter + 1
-            row = {"epoch": epoch, "train_loss": tm["loss"], "val_loss": vm["loss"],
-                   "train_accuracy": tm["accuracy"], "val_accuracy": vm["accuracy"],
-                   "train_macro_f1": tm["macro_f1"], "val_macro_f1": vm["macro_f1"],
+            row = {"epoch": epoch, "train_loss": tm["loss"], "validation_loss": vm["loss"],
+                   **{f"train_{metric}": tm[metric] for metric in CLASSIFICATION_METRICS},
+                   **{f"validation_{metric}": vm[metric] for metric in CLASSIFICATION_METRICS},
                    "learning_rate": optimizer.param_groups[0]["lr"], "duration_seconds": time.perf_counter() - started}
             history.append(row); write_history(run, history)
             payload = checkpoint_payload(model, optimizer, scheduler, epoch, best_epoch, best, counter, cfg, mapping, manifest, stats)
@@ -463,27 +573,16 @@ def train(run: Path, cfg: Dict[str, Any], resume_checkpoint: Optional[Path] = No
 
 def evaluation_metrics(truth: Sequence[int], pred: Sequence[int], probabilities: np.ndarray,
                        labels: Sequence[str], loss: float, duration: float, parameter_count: int) -> Tuple[Dict[str, Any], list, np.ndarray, np.ndarray]:
+    """Evaluate using the shared seven-metric classification definition."""
     ids = list(range(len(labels))); raw = confusion_matrix(truth, pred, labels=ids)
     norm = np.divide(raw, raw.sum(axis=1, keepdims=True), out=np.zeros_like(raw, dtype=float), where=raw.sum(axis=1, keepdims=True) != 0)
-    p, r, f, support = precision_recall_fscore_support(truth, pred, labels=ids, zero_division=0)
-    no_predictions = [labels[i] for i in ids if raw[:, i].sum() == 0]
-    metrics: Dict[str, Any] = {"test_loss": loss, "accuracy": accuracy_score(truth, pred),
-        "balanced_accuracy": balanced_accuracy_score(truth, pred),
-        "macro_precision": precision_score(truth, pred, average="macro", zero_division=0),
-        "weighted_precision": precision_score(truth, pred, average="weighted", zero_division=0),
-        "macro_recall": recall_score(truth, pred, average="macro", zero_division=0),
-        "weighted_recall": recall_score(truth, pred, average="weighted", zero_division=0),
-        "macro_f1": f1_score(truth, pred, average="macro", zero_division=0),
-        "weighted_f1": f1_score(truth, pred, average="weighted", zero_division=0),
-        "top_3_accuracy": (float(np.mean([target in np.argsort(row)[-3:]
-                                           for target, row in zip(truth, probabilities)]))
-                           if len(labels) >= 3 else None),
+    coverage = class_coverage([labels[index] for index in truth], labels)
+    metrics: Dict[str, Any] = {"test_loss": float(loss), **classification_scores(truth, pred),
         "parameter_count": parameter_count, "evaluation_duration_seconds": duration,
         "samples_per_second": len(truth) / duration if duration else None,
-        "zero_division_handling": {"value_used": 0, "classes_with_no_predictions": no_predictions,
-                                    "occurred": bool(no_predictions)}, "sample_count": len(truth)}
-    per_class = [{"class": labels[i], "precision": p[i], "recall": r[i], "f1": f[i], "sample_count": int(support[i])} for i in ids]
-    return metrics, per_class, raw, norm
+        "zero_division_handling": zero_division_details(truth, pred, labels),
+        "class_coverage": coverage, "sample_count": len(truth)}
+    return metrics, per_class_scores(truth, pred, labels), raw, norm
 
 
 def save_matrix(path: Path, matrix: np.ndarray, labels: Sequence[str]) -> None:
@@ -533,25 +632,33 @@ def evaluate_checkpoint(checkpoint: Path, original: bool, data_path: Optional[st
     duration = time.perf_counter() - started; probabilities = np.concatenate(probs); pred = probabilities.argmax(1)
     labels = [x for x, _ in sorted(mapping.items(), key=lambda z: z[1])]
     metrics, per_class, raw, norm = evaluation_metrics(truth, pred, probabilities, labels, total / len(y), duration, sum(p.numel() for p in model.parameters()))
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f"); out = run / "evaluations" / f"{stamp}_{kind}"; out.mkdir(parents=True, exist_ok=False)
+    if metrics["class_coverage"]["absent_classes"]:
+        warnings.warn(f"test split lacks configured classes: {metrics['class_coverage']['absent_classes']}", RuntimeWarning, stacklevel=2)
+    # Original-test artifacts live directly in evaluations/.  Other data uses
+    # its own deterministic directory so it cannot replace the original-test
+    # summary that tools use as the run's canonical test result.
+    out = evaluation_root(run) if original else evaluation_root(run) / kind
+    out.mkdir(parents=True, exist_ok=True)
     metrics.update({"created_at": now(), "checkpoint": str(checkpoint), "evaluation_kind": kind,
                     "data_path": str(pair.data_path), "label_path": str(pair.label_path),
                     "data_checksum_sha256": pair.data_checksum, "label_checksum_sha256": pair.label_checksum})
-    atomic_json(out / "metrics.json", metrics); atomic_json(out / "per_class_metrics.json", per_class)
-    with (out / "per_class_metrics.csv").open("w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=list(per_class[0])); w.writeheader(); w.writerows(per_class)
-    save_matrix(out / "confusion_matrix_raw.csv", raw, labels); save_matrix(out / "confusion_matrix_normalized.csv", norm, labels)
-    plot_matrix(out / "confusion_matrix_raw.png", raw, labels, "Confusion matrix", "d")
-    plot_matrix(out / "confusion_matrix_normalized.png", norm, labels, "Row-normalized confusion matrix", ".2f")
+    # History and evaluation are written independently, so retain their
+    # respective summary sections when either is refreshed.
+    summary = _summary(out / "summarized_metrics.json")
+    summary.update(metrics)
     if original:
-        # Convenience copies describe the final test while timestamped evaluations remain immutable.
-        copies = [(out / "metrics.json", run / "test_metrics.json"),
-                  (out / "per_class_metrics.csv", run / "test_per_class_metrics.csv")]
-        copies.extend((out / n, run / f"test_{n}") for n in
-                      ("confusion_matrix_raw.csv", "confusion_matrix_normalized.csv",
-                       "confusion_matrix_raw.png", "confusion_matrix_normalized.png"))
-        for source, destination in copies:
-            if not destination.exists(): shutil.copy2(source, destination)
+        maxima = best_observed_history(saved_history_for_summary(run))
+        preserved = preserve_best_observed(summary.get("best_observed_per_epoch_metrics"), maxima)
+        if preserved:
+            summary["best_observed_per_epoch_metrics"] = preserved
+    atomic_json(out / "summarized_metrics.json", summary)
+    atomic_json(out / "test_per_class_metrics.json", per_class)
+    with (out / "test_per_class_metrics.csv").open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(per_class[0])); w.writeheader(); w.writerows(per_class)
+    save_matrix(out / "test_confusion_matrix_raw.csv", raw, labels)
+    save_matrix(out / "test_confusion_matrix_normalized.csv", norm, labels)
+    plot_matrix(out / "test_confusion_matrix_raw.png", raw, labels, "Confusion matrix", "d")
+    plot_matrix(out / "test_confusion_matrix_normalized.png", norm, labels, "Row-normalized confusion matrix", ".2f")
     print(f"Evaluation saved to {out}"); return out
 
 

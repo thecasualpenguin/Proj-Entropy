@@ -24,14 +24,15 @@ import sklearn
 import torch
 from sklearn.exceptions import ConvergenceWarning
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import (accuracy_score, balanced_accuracy_score,
-                             confusion_matrix, f1_score, log_loss,
-                             precision_recall_fscore_support)
+from sklearn.metrics import confusion_matrix, log_loss
 from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader, TensorDataset
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE / "src"))
+from classification_metrics import (CLASSIFICATION_METRICS, class_coverage,
+                                    classification_scores, coverage_warnings,
+                                    per_class_scores, zero_division_details)
 from model_resnet_tsc import ResNet
 from run_pipeline import choose_device, RESNET_PREPROCESSING
 from supervised_data import PairData, load_pair, normalize_rows
@@ -228,11 +229,9 @@ def _full_probabilities(probe: LogisticRegression, probabilities: np.ndarray, cl
 
 def _classification_values(y: np.ndarray, predicted: np.ndarray, probabilities: np.ndarray,
                            class_count: int) -> dict[str, float]:
-    """Selection/test scalar metrics using the full checkpoint label universe."""
-    ids = list(range(class_count))
-    return {"accuracy": float(accuracy_score(y, predicted)),
-            "macro_f1": float(f1_score(y, predicted, labels=ids, average="macro", zero_division=0)),
-            "multinomial_log_loss": float(log_loss(y, probabilities, labels=ids))}
+    """Candidate scores with the shared seven metric definitions plus log loss."""
+    return {**classification_scores(y, predicted),
+            "multinomial_log_loss": float(log_loss(y, probabilities, labels=list(range(class_count))))}
 
 
 def _metrics(y: np.ndarray, predicted: np.ndarray, class_names: Sequence[str]) -> tuple[dict[str, Any], list[dict[str, Any]], np.ndarray, np.ndarray]:
@@ -240,17 +239,11 @@ def _metrics(y: np.ndarray, predicted: np.ndarray, class_names: Sequence[str]) -
     raw = confusion_matrix(y, predicted, labels=ids)
     normalized = np.divide(raw, raw.sum(axis=1, keepdims=True), out=np.zeros_like(raw, dtype=float),
                            where=raw.sum(axis=1, keepdims=True) != 0)
-    precision, recall, f1, support = precision_recall_fscore_support(y, predicted, labels=ids, zero_division=0)
-    macro_precision, macro_recall, macro_f1, _ = precision_recall_fscore_support(
-        y, predicted, labels=ids, average="macro", zero_division=0)
-    metrics = {"sample_count": int(len(y)), "accuracy": float(accuracy_score(y, predicted)),
-               "balanced_accuracy": float(balanced_accuracy_score(y, predicted)),
-               "macro_precision": float(macro_precision), "macro_recall": float(macro_recall),
-               "macro_f1": float(macro_f1)}
-    per_class = [{"class": class_names[index], "precision": float(precision[index]),
-                  "recall": float(recall[index]), "f1": float(f1[index]),
-                  "sample_count": int(support[index])} for index in ids]
-    return metrics, per_class, raw, normalized
+    coverage = class_coverage([class_names[index] for index in y], class_names)
+    metrics: dict[str, Any] = {"sample_count": int(len(y)), **classification_scores(y, predicted),
+                               "class_coverage": coverage,
+                               "zero_division_handling": zero_division_details(y, predicted, class_names)}
+    return metrics, per_class_scores(y, predicted, class_names), raw, normalized
 
 
 def _reference_provenance(checkpoint_path: Path, checkpoint: Mapping[str, Any], raw: Mapping[str, Any]) -> tuple[Optional[dict[str, Any]], str]:
@@ -311,25 +304,30 @@ def _load_original_test_reference(checkpoint_path: Path, checkpoint: Optional[Ma
     """Safely load comparable final-test metrics without affecting selection."""
     if checkpoint is None:
         checkpoint = _load_checkpoint(checkpoint_path, torch.device("cpu"))
-    path = checkpoint_path.parent.parent / "test_metrics.json"
+    run = checkpoint_path.parent.parent
+    # New runs keep the canonical original-test summary with all other
+    # evaluation artifacts.  Retain the root-level path as a read-only
+    # fallback for runs made before the layout change.
+    path = run / "evaluations" / "summarized_metrics.json"
+    if not path.is_file(): path = run / "test_metrics.json"
     result: dict[str, Any] = {"status": "unavailable", "source": str(path), "values": {}, "omitted_metrics": []}
     if not path.is_file():
-        result["reason"] = "parent run has no test_metrics.json"
+        result["reason"] = "parent run has no original-test summary"
         return result
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
-        result.update(status="malformed", reason=f"could not parse test_metrics.json: {exc}")
+        result.update(status="malformed", reason=f"could not parse original-test summary: {exc}")
         return result
     if not isinstance(raw, Mapping):
-        result.update(status="malformed", reason="test_metrics.json must contain an object")
+        result.update(status="malformed", reason="original-test summary must contain an object")
         return result
     validation, reason = _reference_provenance(checkpoint_path, checkpoint, raw)
     if validation is None:
         result.update(status="invalid_provenance", reason=reason)
         return result
-    key_options = {"accuracy": ("accuracy",), "balanced_accuracy": ("balanced_accuracy",),
-                   "macro_f1": ("macro_f1",), "multinomial_log_loss": ("multinomial_log_loss", "log_loss", "test_loss")}
+    key_options = {metric: (metric,) for metric in CLASSIFICATION_METRICS}
+    key_options["multinomial_log_loss"] = ("multinomial_log_loss", "log_loss", "test_loss")
     values, source_keys, omitted = {}, {}, []
     for metric, keys in key_options.items():
         value = next((raw[key] for key in keys if key in raw), None)
@@ -363,7 +361,7 @@ def _plot_selection_curves(out: Path, rows: Sequence[Mapping[str, Any]], metric:
 def _plot_final_test_metrics(out: Path, metrics: Sequence[Mapping[str, Any]], reference: Mapping[str, Any]) -> None:
     blocks = [row["block"] for row in metrics]
     fig, (scores, losses) = plt.subplots(1, 2, figsize=(11, 4.5))
-    for metric in ("accuracy", "balanced_accuracy", "macro_f1"):
+    for metric in CLASSIFICATION_METRICS:
         scores.plot(blocks, [row[metric] for row in metrics], "o-", label=metric.replace("_", " "))
         value = reference.get("values", {}).get(metric)
         if value is not None:
@@ -386,6 +384,22 @@ def _write_matrix(path: Path, matrix: np.ndarray, class_names: Sequence[str]) ->
             writer.writerow([name, *row.tolist()])
 
 
+def _candidate_extrema(rows: Sequence[Mapping[str, Any]], block: int) -> dict[str, Any]:
+    """Independent candidate maxima (and diagnostic log-loss minima) for a block."""
+    result: dict[str, Any] = {"classification_metric_maxima": {"train": {}, "validation": {}},
+                              "multinomial_log_loss_minima": {"train": {}, "validation": {}}}
+    block_rows = [row for row in rows if row["block"] == block]
+    for split in ("train", "validation"):
+        for metric in CLASSIFICATION_METRICS:
+            key = f"{split}_{metric}"
+            best = min(block_rows, key=lambda row: (-float(row[key]), float(row["C"])))
+            result["classification_metric_maxima"][split][metric] = {"value": float(best[key]), "C": float(best["C"])}
+        key = f"{split}_multinomial_log_loss"
+        best = min(block_rows, key=lambda row: (float(row[key]), float(row["C"])))
+        result["multinomial_log_loss_minima"][split] = {"value": float(best[key]), "C": float(best["C"])}
+    return result
+
+
 def run_linear_probe(checkpoint_path: Path, *, data_path: Optional[str] = None,
                      label_path: Optional[str] = None, device_spec: str = "auto",
                      batch_size: int = 64, c_values: Sequence[float] = (0.01, 0.1, 1.0, 10.0),
@@ -405,15 +419,21 @@ def run_linear_probe(checkpoint_path: Path, *, data_path: Optional[str] = None,
     # Keep the test labels out of hyperparameter selection entirely.
     targets = {name: _labels(pieces[name], mapping) for name in ("train", "val")}
     class_names = [name for name, _ in sorted(mapping.items(), key=lambda item: item[1])]
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    out = (output_root or checkpoint_path.parent.parent / "linear_probes") / stamp
-    out.mkdir(parents=True, exist_ok=False)
+    split_coverage = {"train": class_coverage(pieces["train"].labels, class_names),
+                      "validation": class_coverage(pieces["val"].labels, class_names),
+                      "test": class_coverage(pieces["test"].labels, class_names)}
+    coverage_messages = coverage_warnings(split_coverage)
+    for message in coverage_messages:
+        warnings.warn(message, RuntimeWarning, stacklevel=2)
+    out = output_root or checkpoint_path.parent.parent / "linear_probes"
+    out.mkdir(parents=True, exist_ok=True)
     reference = _load_original_test_reference(checkpoint_path, checkpoint)
     _json(out / "metadata.json", {"created_at": _now(), "checkpoint": str(checkpoint_path),
           "device": str(device), "sklearn_version": sklearn.__version__, "solver": "lbfgs",
           "multi_class": "multinomial", "class_weight": None, "blocks": list(BLOCKS),
           "pooling": "mean over time; block 3 equals the encoder final global average pool", "C_values": [float(c) for c in c_values],
           "split_mode": checkpoint["split_information"]["mode"], "data_path_override": data_path, "label_path_override": label_path,
+          "class_coverage": split_coverage, "class_coverage_warnings": coverage_messages,
           "original_resnet_test_reference": reference})
     selection_rows: list[dict[str, Any]] = []
     selected: dict[int, tuple[float, float]] = {}
@@ -430,7 +450,7 @@ def run_linear_probe(checkpoint_path: Path, *, data_path: Optional[str] = None,
             train_values = _classification_values(targets["train"], train_prediction, train_probabilities, len(mapping))
             validation_values = _classification_values(targets["val"], validation_prediction, validation_probabilities, len(mapping))
             score = validation_values["macro_f1"]
-            selection_rows.append({"block": block, "C": c,
+            selection_rows.append({"stage": "candidate_train_fit_validation_selection", "block": block, "C": c,
                                    **{f"train_{key}": value for key, value in train_values.items()},
                                    **{f"validation_{key}": value for key, value in validation_values.items()},
                                    "convergence_warning": bool(convergence), "warning": " | ".join(convergence)})
@@ -455,9 +475,10 @@ def run_linear_probe(checkpoint_path: Path, *, data_path: Optional[str] = None,
         probabilities = _full_probabilities(probe, probe.predict_proba(test_scaled), len(mapping))
         metrics, per_class, raw, normalized = _metrics(test_targets, prediction, class_names)
         metrics["multinomial_log_loss"] = _classification_values(test_targets, prediction, probabilities, len(mapping))["multinomial_log_loss"]
-        metrics.update({"block": block, "selected_C": selected_c, "validation_macro_f1": validation_score,
+        metrics.update({"stage": "final_train_validation_refit_test", "block": block, "selected_C": selected_c,
+                        "selection_validation_macro_f1": validation_score,
                         "final_convergence_warning": bool(convergence), "final_warning": " | ".join(convergence)})
-        block_out = out / f"block{block}"; block_out.mkdir()
+        block_out = out / f"block{block}"; block_out.mkdir(exist_ok=True)
         _json(block_out / "final_metrics.json", metrics); _json(block_out / "per_class_metrics.json", per_class)
         with (block_out / "per_class_metrics.csv").open("w", newline="") as handle:
             writer = csv.DictWriter(handle, fieldnames=list(per_class[0])); writer.writeheader(); writer.writerows(per_class)
@@ -469,10 +490,25 @@ def run_linear_probe(checkpoint_path: Path, *, data_path: Optional[str] = None,
         writer = csv.DictWriter(handle, fieldnames=list(selection_rows[0])); writer.writeheader(); writer.writerows(selection_rows)
     _json(out / "selection_metrics.json", selection_rows)
     _plot_selection_curves(out, selection_rows, "accuracy", "selection_accuracy_vs_C.png", reference)
-    _plot_selection_curves(out, selection_rows, "macro_f1", "selection_macro_f1_vs_C.png", reference)
+    _plot_selection_curves(out, selection_rows, "macro_precision", "selection_precision_vs_C.png", reference)
+    _plot_selection_curves(out, selection_rows, "macro_recall", "selection_recall_vs_C.png", reference)
+    _plot_selection_curves(out, selection_rows, "macro_f1", "selection_f1_vs_C.png", reference)
     _plot_selection_curves(out, selection_rows, "multinomial_log_loss", "selection_log_loss_vs_C.png", reference)
     final_metrics = [json.loads((out / f"block{block}" / "final_metrics.json").read_text(encoding="utf-8"))
                      for block in BLOCKS]
+    _json(out / "summarized_metrics.json", {"schema_version": 2, "created_at": _now(),
+          "selection_score_stage": "candidate fits trained on train split only; validation metrics select C",
+          "final_score_stage": "one frozen logistic-regression refit on train+validation followed by one test evaluation",
+          "selection_criterion": "validation_macro_f1 (ties select smaller C)",
+          "class_coverage": split_coverage,
+          "blocks": {f"block{block}": {"selected_C": selected[block][1],
+                     "selection_validation_macro_f1": selected[block][0],
+                     "candidate_pre_refit": _candidate_extrema(selection_rows, block),
+                     "final_train_validation_refit_test_metrics": {
+                         key: final_metrics[block - 1][key] for key in (*CLASSIFICATION_METRICS, "multinomial_log_loss")}}
+                     for block in BLOCKS},
+          "provenance": {"checkpoint": str(checkpoint_path), "split_mode": checkpoint["split_information"]["mode"],
+                         "class_names": class_names, "original_resnet_test_reference": reference}})
     _plot_final_test_metrics(out, final_metrics, reference)
     return out
 
