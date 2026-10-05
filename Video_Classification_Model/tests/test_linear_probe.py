@@ -4,6 +4,7 @@ import copy
 import io
 import json
 import sys
+import warnings
 from contextlib import redirect_stdout
 import tempfile
 import unittest
@@ -194,6 +195,47 @@ class LinearProbeTests(unittest.TestCase):
         self.assertEqual(selected["selected_C"], .1)
         self.assertEqual(selected["candidate_pre_refit"]["classification_metric_maxima"]["validation"]["macro_f1"]["C"], .1)
         self.assertIn("multinomial_log_loss_minima", selected["candidate_pre_refit"])
+
+    def test_full_probabilities_normalizes_float32_roundoff_without_log_loss_warning(self):
+        class FakeProbe:
+            classes_ = np.arange(5)
+
+        # Fixed float32 probabilities keep this regression independent of
+        # whether the installed sklearn solver returns float32 or float64.
+        partial = np.asarray([[.1, .1, .1, .1, .6], [.6, .1, .1, .1, .1]], dtype=np.float32)
+        labels = np.asarray([0, 1])
+        estimator = FakeProbe()
+        self.assertGreater(np.abs(partial.astype(np.float64).sum(axis=1) - 1).max(),
+                           np.sqrt(np.finfo(np.float64).eps))
+        probabilities = probe._full_probabilities(estimator, partial, 5)
+        self.assertEqual(probabilities.dtype, np.float64)
+        np.testing.assert_allclose(probabilities.sum(axis=1), 1, rtol=0, atol=1e-15)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            values = probe._classification_values(labels, probabilities.argmax(axis=1), probabilities, 5)
+        self.assertTrue(np.isfinite(values["multinomial_log_loss"]))
+
+    def test_full_probabilities_preserves_missing_classes_and_rejects_invalid_values(self):
+        class MissingClassProbe:
+            classes_ = np.asarray([0, 2])
+
+        probabilities = probe._full_probabilities(
+            MissingClassProbe(), np.asarray([[.9, .1], [.2, .8]], dtype=np.float32), 3)
+        np.testing.assert_array_equal(probabilities[:, 1], 0)
+        np.testing.assert_allclose(probabilities.sum(axis=1), 1, rtol=0, atol=1e-15)
+
+        class TwoClassProbe:
+            classes_ = np.asarray([0, 1])
+
+        for invalid, message in (
+            (np.asarray([[np.nan, 1.0]]), "non-finite"),
+            (np.asarray([[np.inf, 1.0]]), "non-finite"),
+            (np.asarray([[-.1, 1.1]]), "negative"),
+            (np.asarray([[0.0, 0.0]]), "positive sums"),
+        ):
+            with self.subTest(invalid=invalid):
+                with self.assertRaisesRegex(ValueError, message):
+                    probe._full_probabilities(TwoClassProbe(), invalid, 2)
 
     def test_log_loss_uses_full_label_order_and_reference_failures_are_safe(self):
         class FakeProbe:

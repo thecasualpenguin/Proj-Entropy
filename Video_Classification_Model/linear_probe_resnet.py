@@ -219,11 +219,22 @@ def _fit_probe(x: np.ndarray, y: np.ndarray, c: float, max_iter: int) -> tuple[S
 
 def _full_probabilities(probe: LogisticRegression, probabilities: np.ndarray, class_count: int) -> np.ndarray:
     """Align predict_proba columns with the checkpoint's complete label IDs."""
-    full = np.zeros((len(probabilities), class_count), dtype=float)
+    full = np.zeros((len(probabilities), class_count), dtype=np.float64)
     classes = np.asarray(probe.classes_, dtype=int)
     if (classes < 0).any() or (classes >= class_count).any() or len(classes) != probabilities.shape[1]:
         raise ValueError("probe predict_proba classes are incompatible with checkpoint labels")
     full[:, classes] = probabilities
+    if not np.isfinite(full).all():
+        raise ValueError("probe predict_proba contains non-finite values")
+    if (full < 0).any():
+        raise ValueError("probe predict_proba contains negative values")
+    row_sums = full.sum(axis=1, dtype=np.float64)
+    if not np.isfinite(row_sums).all() or not (row_sums > 0).all():
+        raise ValueError("probe predict_proba rows must have finite positive sums")
+    # A float32 predict_proba row can be within float32's normalization
+    # tolerance but, after padding/upcasting, fail log_loss's float64
+    # tolerance. Normalize only after the float64 padding to avoid that warning.
+    full /= row_sums[:, None]
     return full
 
 
