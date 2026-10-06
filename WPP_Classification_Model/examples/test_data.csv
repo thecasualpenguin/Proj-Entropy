@@ -1,0 +1,4 @@
+video_id,features_path
+test_video_001,features/test_video_001.npz
+test_video_002,features/test_video_002.npz
+test_video_003,features/test_video_003.npz

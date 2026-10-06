@@ -1,0 +1,37 @@
+# Illustrative configuration. The example CSVs reference NPZ placeholders, so copy this
+# configuration and supply contract-compliant NPZ files before running it.
+run:
+  output_root: runs
+  name: multiclass_example
+
+data:
+  train_data_path: ../examples/training_data.csv
+  train_label_path: ../examples/training_labels.csv
+  val_data_path: ../examples/validation_data.csv
+  val_label_path: ../examples/validation_labels.csv
+  test_data_path: ../examples/test_data.csv
+  test_label_path: ../examples/test_labels.csv
+
+classes:
+  class_names: [class_zero, class_one, class_two]
+
+model:
+  architecture: transformer
+  # Exact native-PTS window width: integer, or quoted "1.5" / "3/2" only.
+  window_seconds: 2
+  d_model: 64
+  heads: 4
+  layers: 2
+  dropout: 0.1
+
+training:
+  seed: 0
+  learning_rate: 0.001
+  batch_size: 1
+  gradient_accumulation: 1
+  max_epochs: 20
+  patience: 5
+  class_weights: none
+  monitor: macro_f1
+  device: auto
+  amp: false
