@@ -155,6 +155,43 @@ python -m unittest discover -s tests -v
 
 The tests cover strict CSV loading and preprocessing, splitting and duplicate protections, checkpoint/lifecycle/resume behavior, evaluation artifacts, and frozen-probe compatibility, integrity checks, selection, and outputs.
 
+## WPP native-row workflow (separate from packet classification)
+
+`run_wpp_pipeline.py` and `src/wpp_*.py` are an independent binary `real=0` / `AIGC=1` workflow. They do **not** consume packet CSVs, use packet checkpoints, or alter `run_pipeline.py`.
+
+The default configuration reads the existing DeepAction extractor artifacts directly: `/mnt/d/projects/proj-entropy/deepaction_wpp_outputs/manifest.csv`, its `features/*/features.npz`, `/mnt/d/projects/proj-entropy/datasets/deepaction_v1`, and the official captions CSV. `src/wpp_deepaction_adapter.py` creates a versioned, lazy `wpp-v1` run input index; it copies no features and validates source paths, source-derived labels, captions/prompts, timing, feature artifacts, fingerprints, and the full 2,605-record inventory. A failed extractor row is recorded, never silently dropped; strict final training refuses any failures. The temporary real-corpus smoke config explicitly records the current repair failures and uses only already-assigned train examples.
+
+The internal `wpp-v1` contract has `schema_version: "wpp-v1"` and a `videos` list. Every complete item requires `video_id`, `status: "complete"`, `prompt_id` (or `prompt_text`), `label`, `source`, exact integer `time_base: {num, den}`, `clip_end_pts`, and either native frames or a lazy adapter descriptor. Frames require strictly increasing integer `pts`, positive `duration_pts`, and native `rows`, each exactly `[delta_row_share, row_share]` in that order (or an object with precisely those two keys). `clip_end_pts` must equal the final encoded frame end.
+
+Frames are assigned exactly once by `floor((frame_start_pts - first_pts) / 2 seconds)` to non-overlapping exact-rational nominal windows. Every nonempty terminal window is retained. Aggregation weight is the **assigned native interval mass** (sum of complete encoded frame durations assigned to that start-PTS bucket), including the final-frame duration. A frame crossing a nominal boundary is not copied; its full interval remains in its start bucket. Empty buckets create no token and sparse gaps do not invent duration. Checkpoint/run `windowing.json` records nominal bounds, frame indices, boundary-cross flags, and assigned-duration totals. Valid numerical zero rows are data, not padding. All 100 prompt groups, including mixed real/AIGC variants, are shuffled globally with seed 42 into 70/15/15 before failed records are filtered.
+
+The ResNet and Transformer are distinct random-initialized width-64 models. Both encode native CTU rows per frame, then frames per two-second window; the Transformer uses structural row order and native-PTS positional encodings. Padding is explicitly masked after layers. Training fits a streaming per-channel train-only normalizer on valid native rows, applies duration-weighted differentiable window-logit aggregation to one video logit, and uses video-count class weights `N/(2*n_class)`. It never resamples, interpolates, truncates, caps, or oversamples windows/rows/frames.
+
+The final default config has strict preflight: it requires exactly 2,605 extractor-manifest records and no failed status. It is intentionally blocked until repair/audit completes. No manually created WPP manifest or approval table is required. For a non-final real-train-only CUDA smoke, use `configs/wpp_real_smoke.yaml`:
+
+```sh
+/home/naoromi/miniforge3/envs/entropy/bin/python run_wpp_pipeline.py smoke \
+  --config configs/wpp_real_smoke.yaml --architecture resnet --epochs 2
+/home/naoromi/miniforge3/envs/entropy/bin/python run_wpp_pipeline.py smoke \
+  --config configs/wpp_real_smoke.yaml --architecture transformer --epochs 2
+```
+
+Create a corpus-audited WPP config from `configs/wpp_default.yaml`, set `data.manifest`, then run (only after corpus approval):
+
+```sh
+/home/naoromi/miniforge3/envs/entropy/bin/python run_wpp_pipeline.py train \
+  --config /path/to/wpp_resnet.yaml --run-name resnet_seed42
+```
+
+After the external corpus audit releases the final fingerprints, launch the two final runs sequentially (never reuse a smoke checkpoint):
+
+```sh
+/home/naoromi/miniforge3/envs/entropy/bin/python run_wpp_pipeline.py train --config configs/wpp_default.yaml --run-name resnet_seed42
+/home/naoromi/miniforge3/envs/entropy/bin/python run_wpp_pipeline.py train --config configs/wpp_deepaction_transformer.yaml --run-name transformer_seed42
+```
+
+WPP checkpoints are format-version 1 and separately save model/optimizer/scheduler/AMP/RNG state, model/training config, split, train-only normalizer plus fit IDs, manifest fingerprint, and class weights. Validation selection is video macro-F1, tie-broken by lower video weighted CE; scheduler uses validation weighted CE; canonical test evaluation is performed once after selection.
+
 ## Packet-dataset extraction
 
 `extract_packet_dataset.py` is a standalone producer; it does not invoke or import `run_pipeline.py`. It requires `ffprobe` from FFmpeg on `PATH` and expects an input tree of `class/group/.../video` (class labels and group names are taken literally):

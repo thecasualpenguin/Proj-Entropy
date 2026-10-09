@@ -12,8 +12,8 @@ data:
   test_data_path: ../examples/test_data.csv
   test_label_path: ../examples/test_labels.csv
 
-classes:
-  class_names: [class_zero, class_one, class_two]
+# Omit classes.class_names to infer the sorted canonical vocabulary from
+# training_labels.csv. Labels may be identities such as "016".
 
 model:
   architecture: transformer

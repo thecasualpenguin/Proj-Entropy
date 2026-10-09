@@ -36,10 +36,16 @@ video_id,label
 ```
 
 - `video_id` is nonempty and unique.
-- `label` is one exact integer class ID for that video, not a multilabel list.
-- Data and label IDs must match as sets; matching is by `video_id`, never CSV row position.
+- `label` is one nonempty text identity/class value for that video, not a multilabel list. It is read with Python's CSV reader as text, so values such as `016` retain leading zeroes.
+- Data and label IDs must match as sets; matching is by `video_id`, never CSV row position. `video_id` values are exact strings and are never case-folded.
 
-`classes.class_names` is an ordered YAML list. It maps IDs `0..C-1` to names, and sets dynamic class count `C`. A duplicate ID, malformed non-integer label, or label outside `0..C-1` is an explicit validation error. There is exactly one class per video.
+By default no class list is needed. The classifier infers its vocabulary **from the supplied training label CSV only**, canonicalizing every label with `str(value).strip().casefold()` and lexically sorting the unique canonical values (so numeric-looking text follows lexical order, e.g. `0`, `1`, `10`). It maps that ordered vocabulary to internal IDs `0..C-1` solely for cross-entropy. Thus training labels `001`, `002`, `016` map to IDs `0`, `1`, `2`; a short training subset `001`, `016` maps to `0`, `1` (never to identity-derived numeric IDs). Whitespace-only labels are rejected. Case/space variants such as `PersonA` and ` persona ` intentionally collapse to the legacy-compatible canonical `persona`.
+
+Validation and test labels must canonicalize to a training vocabulary value. An unknown label is rejected with its `video_id`; validation/test never enlarge the vocabulary. Metrics, reports, checkpoint metadata, and prediction class names use the full training vocabulary, so classes absent from validation/test remain present with zero support.
+
+For compatibility with old trained runs, supplying a nonempty `classes.class_names` list selects **indexed mode**: labels must again be exact integer IDs `0..C-1`, and the list is the display vocabulary. Do not retain a legacy class list when new CSV labels are person IDs such as `016`; omit `classes` (or set `class_names: []`) to use raw-label inference. There is exactly one class per video.
+
+The Gait exporter now writes its `labels.csv` identity values directly. Its optional `class_mapping.csv` and `classes.yaml` remain legacy indexed-mode aids, not inputs required by inferred mode: a short caller-owned training split has its own persisted mapping.
 
 ## 4. Required NPZ arrays
 

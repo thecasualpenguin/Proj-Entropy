@@ -26,7 +26,8 @@ def load_config(path):
     if not isinstance(raw,dict): raise ValueError("configuration root must be a mapping")
     unknown=set(raw)-set(DEFAULT)-{'data','classes'}
     if unknown: raise ValueError(f"unknown configuration sections: {sorted(unknown)}")
-    if not isinstance(raw.get('data'),dict) or not isinstance(raw.get('classes'),dict): raise ValueError("data and classes mappings are required")
+    if not isinstance(raw.get('data'),dict): raise ValueError("data mapping is required")
+    if 'classes' in raw and not isinstance(raw['classes'],dict): raise ValueError("classes must be a mapping when supplied")
     cfg=deepcopy(DEFAULT)
     for section in ('run','model','training'):
         supplied=raw.get(section,{})
@@ -37,9 +38,16 @@ def load_config(path):
     data=raw['data']; missing=[x for x in REQUIRED_PATHS if not data.get(x)]
     if missing: raise ValueError(f"missing required data paths: {missing}")
     cfg['data']={k:str(resolve_path(path.parent,v)) for k,v in data.items() if k in REQUIRED_PATHS}
-    names=raw['classes'].get('class_names')
-    if not isinstance(names,list) or len(names)<1 or any(not isinstance(x,str) or not x for x in names) or len(set(names))!=len(names): raise ValueError("classes.class_names must be a unique nonempty list")
-    cfg['classes']={'class_names':names}
+    supplied_classes=raw.get('classes',{})
+    bad=set(supplied_classes)-{'class_names'}
+    if bad: raise ValueError(f"unknown keys in classes: {sorted(bad)}")
+    names=supplied_classes.get('class_names')
+    # A missing, null, or empty list opts into raw-label vocabulary inference.
+    if names in (None,[]):
+        cfg['classes']={'label_mode':'raw_inferred','class_names':None}
+    else:
+        if not isinstance(names,list) or any(not isinstance(x,str) or not x for x in names) or len(set(names))!=len(names): raise ValueError("classes.class_names must be a unique nonempty list, or be omitted for raw-label inference")
+        cfg['classes']={'label_mode':'indexed','class_names':list(names)}
     m,t=cfg['model'],cfg['training']; exact_seconds(m['window_seconds'])
     if m['architecture'] not in ('resnet','transformer'): raise ValueError("model.architecture must be resnet or transformer")
     for k in ('width','d_model','heads','layers','resnet_blocks'):
@@ -49,7 +57,8 @@ def load_config(path):
     for k in ('seed','batch_size','max_epochs','patience','gradient_accumulation'):
         if not isinstance(t[k],int) or isinstance(t[k],bool) or t[k]< (0 if k=='seed' else 1): raise ValueError(f"training.{k} is invalid")
     if not isinstance(t['learning_rate'],(int,float)) or t['learning_rate']<=0: raise ValueError("training.learning_rate must be positive")
-    if t['class_weights'] not in ('none','inverse_frequency') and not (isinstance(t['class_weights'],list) and len(t['class_weights'])==len(names) and all(isinstance(x,(int,float)) and x>0 for x in t['class_weights'])): raise ValueError("training.class_weights must be none, inverse_frequency, or a positive vector of C values")
+    if t['class_weights'] not in ('none','inverse_frequency') and not (isinstance(t['class_weights'],list) and all(isinstance(x,(int,float)) and x>0 for x in t['class_weights'])): raise ValueError("training.class_weights must be none, inverse_frequency, or a positive vector of C values")
+    if isinstance(t['class_weights'],list) and cfg['classes']['class_names'] is not None and len(t['class_weights'])!=len(cfg['classes']['class_names']): raise ValueError("training.class_weights vector must have one value per class")
     if not isinstance(t['amp'],bool): raise ValueError("training.amp must be a boolean")
     if t['monitor'] not in ('macro_f1','weighted_ce'): raise ValueError("training.monitor must be macro_f1 or weighted_ce")
     cfg['_config_path']=str(path); cfg['run']['output_root']=str(resolve_path(path.parent,cfg['run']['output_root']))
