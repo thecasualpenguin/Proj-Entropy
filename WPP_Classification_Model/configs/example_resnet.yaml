@@ -1,7 +1,7 @@
 # ResNet template for caller-prepared Gait CSV splits. These six external files
 # are not created by this project; their data rows may reference the exported NPZs.
 run:
-  output_root: /mnt/d/projects/proj-entropy/wpp_model_runs
+  output_root: runs
   name: gait_resnet
 
 data:

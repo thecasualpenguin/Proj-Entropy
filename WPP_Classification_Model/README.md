@@ -14,21 +14,23 @@ python -m pip install torch numpy scikit-learn PyYAML matplotlib
 
 ## Run
 
-Paths in YAML resolve relative to its location; `features_path` resolves relative to its data CSV. On a native Windows run, native absolute Windows paths are accepted.
+`data` paths in YAML resolve relative to the YAML file; `features_path` resolves relative to its data CSV. In contrast, `run.output_root` resolves relative to the process working directory (so `runs` is `./runs` where the command is launched). On a native Windows run, native absolute Windows paths are accepted.
 
 ```sh
 python run_pipeline.py train --config /absolute/path/to/config.yaml
-python run_pipeline.py train --config configs/example.yaml --resume runs/my_run/checkpoints/latest.pt
+python run_pipeline.py train --config configs/example.yaml --run-name experiment_01
+python run_pipeline.py train --config configs/example.yaml --run-name experiment_01 \
+  --resume runs/experiment_01/checkpoints/latest.pt
 # An extra evaluation must use a fresh directory; canonical test output is protected.
 python run_pipeline.py evaluate --config /absolute/path/to/config.yaml \
   --checkpoint runs/my_run/checkpoints/best.pt --output runs/my_run/manual_evaluation
 ```
 
-Training uses only supplied train/validation splits to select a checkpoint, then evaluates the supplied test split once into `test_evaluation/`. `evaluate` will not overwrite that canonical directory. Resume rejects any config, CSV, mapping, or NPZ-content-hash changes. A completed canonical test is immutable: resuming its latest checkpoint is allowed only as a no-op verification; additional epochs must resume an interrupted pre-test run.
+Training uses only supplied train/validation splits to select a checkpoint, then evaluates the supplied test split once into `evaluations/`. `evaluate` will not overwrite that canonical directory. Resume rejects any config, CSV, mapping, or NPZ-content-hash changes. A completed canonical test is immutable: resuming its latest checkpoint is allowed only as a no-op verification; additional epochs must resume an interrupted pre-test run.
 
 ## Configuration
 
-`data` contains exactly the six paths shown in `configs/example.yaml`. The minimal raw-label configuration is just those six paths (no `classes` mapping):
+`data` contains exactly the six paths shown in `configs/example.yaml`. `run.output_root` defaults to `runs`; `run.name` is optional and defaults to a `run_YYYYMMDD_HHMMSS` timestamp. `--run-name` takes precedence over `run.name`. Names must be a single safe path component, and a new run never overwrites an existing directory. When resuming, an omitted name reuses the checkpoint's persisted name; the effective name (CLI override, otherwise YAML) must match the checkpoint. Repeat `--run-name` on resume if it originally overrode a configured name. The minimal raw-label configuration is just those six paths (no `classes` mapping):
 
 ```yaml
 data:
@@ -60,7 +62,11 @@ Useful `training` values are `max_epochs`, `learning_rate`, `batch_size`, `gradi
 
 ## Outputs and metric convention
 
-The run directory stores `config.json`, train-only `normalizer.json`, input/feature content hashes, checkpoints, epoch metrics/curves, and `summary.json`. Canonical test files include per-class support/metrics, raw and row-normalized confusion CSV/PNG, and optional one-vs-rest ROC-AUC/AP diagnostics. The seven headline values are `accuracy`, macro/weighted precision, macro/weighted recall, and macro/weighted F1, using sklearn labels for **all configured classes**. Precision/recall/F1 use `zero_division=0`; absent-class ROC/AP is `null` with a reason, never dropped.
+The run directory stores `config.json` (including the concrete generated or overridden run name), train-only `normalizer.json`, input/feature content hashes, `checkpoints/{best,latest}.pt`, and `status.json`. Canonical reporting is written only to `evaluations/`: `per_epoch_metrics.csv/json`, `loss_curves.png`, `accuracy_curves.png`, `precision_curves.png`, `recall_curves.png`, `f1_curves.png`, `summarized_metrics.json`, and test per-class/confusion-matrix CSV/PNG files. `status.json` records completion, epoch count, checkpoint selection, and whether training stopped by patience or max epochs.
+
+`summarized_metrics.json` contains the canonical test metrics plus provenance, normalizer and checkpoint references, selection details, and `best_observed_per_epoch_metrics`. The latter independently records the maximum value and earliest epoch on ties for every one of the seven train and validation classification metrics; it is not checkpoint selection. `checkpoint_selection` separately records the selected checkpoint epoch and its train/validation metrics. The selected checkpoint continues to use configurable validation `macro_f1` maximization or validation weighted cross-entropy minimization.
+
+The seven headline values are `accuracy`, macro/weighted precision, macro/weighted recall, and macro/weighted F1. Macro and weighted averages use only classes present in that split's ground truth (while per-class files retain every configured class); predictions to absent configured classes remain errors. Precision/recall/F1 use `zero_division=0`; absent-class ROC/AP is `null` with a reason, never dropped. Epoch train metrics are **online** predictions made while shuffled training examples are in `model.train()` and optimizer updates occur; validation and standalone checkpoint evaluation use `model.eval()`. Thus an epoch train value is intentionally not a second, post-epoch inference pass.
 
 Normalization is a train-only streaming mean/std for `[delta_row_share, row_share]` over valid native cells. Explicit masks—not feature zeros—represent padding. No resizing, interpolation, truncation, or delta reset occurs.
 
