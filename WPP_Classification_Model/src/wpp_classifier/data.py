@@ -5,7 +5,9 @@ from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
 import numpy as np
-from .config import exact_seconds
+from .config import exact_seconds, INPUT_CONTRACT
+
+CONTRACT_NPZ_KEYS={'input_contract_version','display_width','display_height','fps_num','fps_den'}
 
 @dataclass
 class Video:
@@ -90,28 +92,37 @@ def load_split(data_path,label_path,label_mapping):
  for r in drows:
   fp=Path(r['features_path']).expanduser(); fp=fp if fp.is_absolute() else data_path.parent/fp
   videos.append(_npz(fp.resolve(),r['video_id'],labels[r['video_id']]))
- return videos, {'data_path':str(data_path.resolve()),'label_path':str(label_path.resolve()),'data_sha256':sha256(data_path),'label_sha256':sha256(label_path),'video_ids':[v.video_id for v in videos], 'feature_sha256':{v.video_id:sha256(v.path) for v in videos}}
+ return videos, {'data_path':str(data_path.resolve()),'label_path':str(label_path.resolve()),'data_sha256':sha256(data_path),'label_sha256':sha256(label_path),'video_ids':[v.video_id for v in videos], 'feature_sha256':{v.video_id:sha256(v.path) for v in videos},'media_contract':dict(INPUT_CONTRACT)}
 
 def _npz(path,vid,label):
  if path.suffix.lower()!='.npz': raise ValueError(f"{vid}: features_path must name an NPZ")
  if not path.is_file(): raise ValueError(f"{vid}: NPZ not found: {path}")
  try:
   with np.load(path,allow_pickle=False) as z:
-   need={'row_share','delta_row_share','pts','frame_duration','time_base'}
+   need={'row_share','delta_row_share','pts','frame_duration','time_base'} | CONTRACT_NPZ_KEYS
    miss=need-set(z.files)
-   if miss: raise ValueError(f"{vid}: missing NPZ arrays {sorted(miss)}")
+   if miss: raise ValueError(f"{vid}: missing required input-contract NPZ arrays {sorted(miss)}")
    a,b,pts,dur,tb=(z[x].copy() for x in ('row_share','delta_row_share','pts','frame_duration','time_base'))
+   contract={key:z[key].copy() for key in CONTRACT_NPZ_KEYS}
  except Exception as e:
   if isinstance(e,ValueError): raise
   raise ValueError(f"{vid}: unreadable NPZ: {e}")
  if a.dtype not in (np.dtype('float32'),np.dtype('float64')) or b.dtype not in (np.dtype('float32'),np.dtype('float64')): raise ValueError(f"{vid}: feature arrays must be float32 or float64")
  if pts.dtype!=np.int64 or dur.dtype!=np.int64 or tb.dtype!=np.int64: raise ValueError(f"{vid}: pts, frame_duration, time_base must be int64")
+ for key,expected in INPUT_CONTRACT.items():
+  value=contract[key]
+  if value.dtype != np.int64 or value.size != 1: raise ValueError(f"{vid}: {key} must be an int64 scalar or size-1 array")
+  if int(value.reshape(-1)[0]) != expected: raise ValueError(f"{vid}: incompatible {key}={int(value.reshape(-1)[0])}; required {expected}")
  if a.ndim!=2 or a.shape!=b.shape or not all(x>0 for x in a.shape): raise ValueError(f"{vid}: features must share nonempty [T,R] shape")
  t,r=a.shape
  if pts.shape!=(t,) or dur.shape!=(t,) or tb.shape!=(2,): raise ValueError(f"{vid}: timing shapes must be pts[T], frame_duration[T], time_base[2]")
  if not np.isfinite(a).all() or not np.isfinite(b).all(): raise ValueError(f"{vid}: features must be finite")
  # Avoid int64 subtraction overflow for e.g. [-INT64_MAX, INT64_MAX].
  if any(int(pts[i+1]) <= int(pts[i]) for i in range(t-1)) or not np.all(dur>0) or not np.all(tb>0): raise ValueError(f"{vid}: pts must strictly increase; duration and time_base must be positive")
+ tick=Fraction(int(tb[0]),int(tb[1])); frame=Fraction(1,15)
+ if any(Fraction(int(value),1)*tick != frame for value in dur): raise ValueError(f"{vid}: every frame_duration must represent exactly 1/15 seconds")
+ first=int(pts[0])
+ if any(Fraction(int(value)-first,1)*tick != index*frame for index,value in enumerate(pts)): raise ValueError(f"{vid}: pts must advance exactly 1/15 seconds from the first PTS")
  return Video(vid,label,np.stack([b,a],-1).astype(np.float32),pts,dur,(int(tb[0]),int(tb[1])),str(path))
 
 def make_windows(video, seconds):

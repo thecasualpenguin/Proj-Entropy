@@ -10,7 +10,7 @@ class RunOutputTest(unittest.TestCase):
  def _dataset(self,root):
   for split in ('train','val','test'):
    vid=f'{split}-0'
-   np.savez(root/f'{vid}.npz',row_share=np.array([[1.]],np.float32),delta_row_share=np.array([[0.]],np.float32),pts=np.array([0],np.int64),frame_duration=np.array([1],np.int64),time_base=np.array([1,1],np.int64))
+   np.savez(root/f'{vid}.npz',row_share=np.array([[1.]],np.float32),delta_row_share=np.array([[0.]],np.float32),pts=np.array([0],np.int64),frame_duration=np.array([1],np.int64),time_base=np.array([1,15],np.int64),input_contract_version=np.array(1,np.int64),display_width=np.array(512,np.int64),display_height=np.array(512,np.int64),fps_num=np.array(15,np.int64),fps_den=np.array(1,np.int64))
    (root/f'{split}_data.csv').write_text(f'video_id,features_path\n{vid},{vid}.npz\n',encoding='utf8')
    (root/f'{split}_labels.csv').write_text(f'video_id,label\n{vid},0\n',encoding='utf8')
  def _config(self,root):

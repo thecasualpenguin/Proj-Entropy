@@ -2,7 +2,7 @@
 
 A self-contained PyTorch classifier for **one class label per whole video** from native WPP NPZs. It is independent of the encoder/extractor and of `Video_Classification_Model`; it does not create splits, infer corpus/source/prompt metadata, rebalance data, or read MP4/sidecar files.
 
-`INPUT_CONTRACT.md` is authoritative for inputs and exact timing semantics. In particular, callers provide all six explicit CSV paths, CSVs join by `video_id` (not row order), and each feature path is one self-contained NPZ. The included example CSVs are illustrative only: their NPZs are deliberately absent and therefore `configs/example.yaml` is **not runnable**.
+`INPUT_CONTRACT.md` is authoritative for inputs and exact timing semantics. In particular, callers provide all six explicit CSV paths, CSVs join by `video_id` (not row order), and each feature path is one self-contained NPZ. Every NPZ must verify contract version 1, normalized `512x512` display, and an exact `15/1` fps clock (including every final-frame duration); legacy artifacts are rejected. The included example CSVs are illustrative only: their NPZs are deliberately absent and therefore `configs/example.yaml` is **not runnable**.
 
 ## Install
 
@@ -56,13 +56,15 @@ For old indexed CSVs, provide a nonempty `classes.class_names` list. This compat
 
 The default target is `/mnt/d/projects/proj-entropy/deepaction_wpp_source_splits_transformer_seed42`. It reproduces the adapter's seed-42 prompt grouping (sorted canonical prompt IDs, local shuffle, Python `round`, and clamps), so variants sharing a prompt never cross train/validation/test. Review `split_audit.json`, `prompt_assignments.csv`, and `coverage_counts.csv` before putting the six generated paths into a training config.
 
-Defaults: Transformer (`d_model: 64`, `heads: 4`, `layers: 2`, dropout `.1`), or `architecture: resnet` (width 64, three residual temporal blocks). `model.window_seconds` is exact: use an integer (`2`) or a quoted string (`"1.5"`, `"3/2"`), never a YAML float. Frames are bucketed by native PTS, each frame exactly once, and full frame duration is used to aggregate window logits into one video logit.
+Defaults: Transformer (`d_model: 64`, `heads: 4`, `layers: 2`, dropout `.1`), or `architecture: resnet` (width 64, three residual temporal blocks). A third choice, `architecture: convtran`, is an **adapted ConvTran**: it keeps ConvTran tAPE and post-softmax eRPE temporal attention, but replaces the fixed sensor tokenizer with masked local spatial-temporal convolutions over native `[T,R,2]` WPP rows followed by learned masked spatial reduction. It accepts variable row counts directly; it never pre-averages rows. `convtran_layers`, `convtran_heads`, `convtran_ff_multiplier`, and odd `convtran_kernel_size` configure only this architecture. Its finite tAPE/eRPE tables are derived exactly as `ceil(window_seconds * 15)`, so over-bound windows fail rather than truncate; short terminal windows are valid. See `configs/example_convtran.yaml`.
+
+`model.window_seconds` is exact: use an integer (`2`) or a quoted string (`"1.5"`, `"3/2"`), never a YAML float. Frames are bucketed by native PTS, each frame exactly once, and full frame duration is used to aggregate window logits into one video logit.
 
 Useful `training` values are `max_epochs`, `learning_rate`, `batch_size`, `gradient_accumulation`, `patience`, `device` (`auto`, `cpu`, `cuda`), `class_weights` (`none`, `inverse_frequency`, or a positive C-length vector), and `monitor` (`macro_f1` or `weighted_ce`). One optimizer update covers `batch_size * gradient_accumulation` videos; a tail uses its actual video count. On OOM, only retry microbatching is reduced: the full update group and all frames remain unchanged. No balancing is automatic.
 
 ## Outputs and metric convention
 
-The run directory stores `config.json` (including the concrete generated or overridden run name), train-only `normalizer.json`, input/feature content hashes, `checkpoints/{best,latest}.pt`, and `status.json`. Canonical reporting is written only to `evaluations/`: `per_epoch_metrics.csv/json`, `loss_curves.png`, `accuracy_curves.png`, `precision_curves.png`, `recall_curves.png`, `f1_curves.png`, `summarized_metrics.json`, and test per-class/confusion-matrix CSV/PNG files. `status.json` records completion, epoch count, checkpoint selection, and whether training stopped by patience or max epochs.
+The run directory stores `config.json` (including the concrete generated or overridden run name, strict media contract, and derived ConvTran temporal bound), train-only `normalizer.json`, input/feature content hashes, `checkpoints/{best,latest}.pt`, and `status.json`. Checkpoints from before this strict media contract are deliberately incompatible and rejected. Canonical reporting is written only to `evaluations/`: `per_epoch_metrics.csv/json`, `loss_curves.png`, `accuracy_curves.png`, `precision_curves.png`, `recall_curves.png`, `f1_curves.png`, `summarized_metrics.json`, and test per-class/confusion-matrix CSV/PNG files. `status.json` records completion, epoch count, checkpoint selection, and whether training stopped by patience or max epochs.
 
 `summarized_metrics.json` contains the canonical test metrics plus provenance, normalizer and checkpoint references, selection details, and `best_observed_per_epoch_metrics`. The latter independently records the maximum value and earliest epoch on ties for every one of the seven train and validation classification metrics; it is not checkpoint selection. `checkpoint_selection` separately records the selected checkpoint epoch and its train/validation metrics. The selected checkpoint continues to use configurable validation `macro_f1` maximization or validation weighted cross-entropy minimization.
 
@@ -77,3 +79,7 @@ python -m unittest discover -s tests -v
 ```
 
 Tests create temporary synthetic NPZs; they do not train on project data or alter external encoder/extractor artifacts.
+
+## ConvTran attribution
+
+The ConvTran attention design is adapted from [Navid Fouladi's ConvTran](https://github.com/Navidfoumani/ConvTran), licensed MIT. This repository contains a clean, minimal WPP-specific implementation rather than copied upstream source; its native-row tokenizer and mask handling are local code. See `THIRD_PARTY_NOTICES.md`.

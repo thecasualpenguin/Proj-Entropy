@@ -9,7 +9,7 @@ from wpp_classifier.pipeline import train,eval_checkpoint
 
 class LabelInferenceTest(unittest.TestCase):
  def _npz(self,path,value):
-  np.savez(path,row_share=np.array([[1.]],np.float32),delta_row_share=np.array([[value]],np.float32),pts=np.array([0],np.int64),frame_duration=np.array([1],np.int64),time_base=np.array([1,1],np.int64))
+  np.savez(path,row_share=np.array([[1.]],np.float32),delta_row_share=np.array([[value]],np.float32),pts=np.array([0],np.int64),frame_duration=np.array([1],np.int64),time_base=np.array([1,15],np.int64),input_contract_version=np.array(1,np.int64),display_width=np.array(512,np.int64),display_height=np.array(512,np.int64),fps_num=np.array(15,np.int64),fps_den=np.array(1,np.int64))
  def _csv(self,path,header,rows):
   with path.open('w',newline='',encoding='utf8') as f: w=csv.writer(f);w.writerow(header);w.writerows(rows)
  def test_train_only_raw_vocabulary_checkpoint_and_unknown_rejection(self):

@@ -13,7 +13,7 @@ class RawLabelSmokeTest(unittest.TestCase):
  def _npz(self,path,index):
   t,r=2+index,1+(index%2)
   np.savez(path,row_share=np.full((t,r),1/r,np.float32),delta_row_share=np.full((t,r),index*.1,np.float32),
-           pts=np.arange(t,dtype=np.int64)*7-3,frame_duration=np.full(t,7,np.int64),time_base=np.array([1,10],np.int64))
+           pts=np.arange(t,dtype=np.int64)-3,frame_duration=np.ones(t,np.int64),time_base=np.array([1,15],np.int64),input_contract_version=np.array(1,np.int64),display_width=np.array(512,np.int64),display_height=np.array(512,np.int64),fps_num=np.array(15,np.int64),fps_den=np.array(1,np.int64))
  def _dataset(self,root,labels=('001','016','124')):
   for split in ('train','val','test'):
    use=labels if split != 'val' else labels[:1]

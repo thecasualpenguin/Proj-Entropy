@@ -2,11 +2,13 @@
 from __future__ import annotations
 from copy import deepcopy
 from fractions import Fraction
+
+INPUT_CONTRACT={'input_contract_version':1,'display_width':512,'display_height':512,'fps_num':15,'fps_den':1}
 from pathlib import Path
 import yaml
 
 DEFAULT = {"run":{"output_root":"runs", "name":None},
- "model":{"architecture":"transformer", "window_seconds":2, "width":64, "d_model":64, "heads":4, "layers":2, "dropout":0.1, "resnet_blocks":3},
+ "model":{"architecture":"transformer", "window_seconds":2, "width":64, "d_model":64, "heads":4, "layers":2, "dropout":0.1, "resnet_blocks":3, "convtran_layers":2, "convtran_heads":4, "convtran_ff_multiplier":2, "convtran_kernel_size":3},
  "training":{"seed":0,"learning_rate":0.001,"batch_size":1,"max_epochs":20,"patience":5,"device":"auto","amp":False,"gradient_accumulation":1,"class_weights":"none","monitor":"macro_f1"}}
 REQUIRED_PATHS=("train_data_path","train_label_path","val_data_path","val_label_path","test_data_path","test_label_path")
 
@@ -49,10 +51,19 @@ def load_config(path):
         if not isinstance(names,list) or any(not isinstance(x,str) or not x for x in names) or len(set(names))!=len(names): raise ValueError("classes.class_names must be a unique nonempty list, or be omitted for raw-label inference")
         cfg['classes']={'label_mode':'indexed','class_names':list(names)}
     m,t=cfg['model'],cfg['training']; exact_seconds(m['window_seconds'])
-    if m['architecture'] not in ('resnet','transformer'): raise ValueError("model.architecture must be resnet or transformer")
+    if m['architecture'] not in ('resnet','transformer','convtran'): raise ValueError("model.architecture must be resnet, transformer, or convtran")
     for k in ('width','d_model','heads','layers','resnet_blocks'):
         if not isinstance(m[k],int) or isinstance(m[k],bool) or m[k]<=0: raise ValueError(f"model.{k} must be a positive integer")
     if m['d_model']%m['heads']: raise ValueError("model.d_model must be divisible by model.heads")
+    if m['architecture']=='convtran':
+        for k in ('convtran_layers','convtran_heads','convtran_ff_multiplier'):
+            if not isinstance(m[k],int) or isinstance(m[k],bool) or m[k]<=0: raise ValueError(f"model.{k} must be a positive integer")
+        if m['d_model']%m['convtran_heads']: raise ValueError("model.d_model must be divisible by model.convtran_heads")
+        if not isinstance(m['convtran_kernel_size'],int) or isinstance(m['convtran_kernel_size'],bool) or m['convtran_kernel_size'] <= 0 or not m['convtran_kernel_size'] % 2: raise ValueError("model.convtran_kernel_size must be a positive odd integer")
+        # ConvTran tables are deliberately finite: derive their bound exactly from the
+        # fixed 15 fps media contract rather than accepting a truncating frame cap.
+        seconds=exact_seconds(m['window_seconds']); m['convtran_max_frames']=(seconds*15).__ceil__()
+        if m['convtran_max_frames'] <= 0: raise ValueError("model.window_seconds gives no ConvTran frames")
     if not isinstance(m['dropout'],(int,float)) or not 0<=m['dropout']<1: raise ValueError("model.dropout must be in [0,1)")
     for k in ('seed','batch_size','max_epochs','patience','gradient_accumulation'):
         if not isinstance(t[k],int) or isinstance(t[k],bool) or t[k]< (0 if k=='seed' else 1): raise ValueError(f"training.{k} is invalid")
@@ -61,6 +72,8 @@ def load_config(path):
     if isinstance(t['class_weights'],list) and cfg['classes']['class_names'] is not None and len(t['class_weights'])!=len(cfg['classes']['class_names']): raise ValueError("training.class_weights vector must have one value per class")
     if not isinstance(t['amp'],bool): raise ValueError("training.amp must be a boolean")
     if t['monitor'] not in ('macro_f1','weighted_ce'): raise ValueError("training.monitor must be macro_f1 or weighted_ce")
+    # Persist this fixed external media contract into run config/checkpoints.
+    cfg['input_contract']=deepcopy(INPUT_CONTRACT)
     cfg['_config_path']=str(path)
     cfg['run']['output_root']=str(Path(str(cfg['run']['output_root'])).expanduser().resolve())
     validate_run_name(cfg['run']['name'])

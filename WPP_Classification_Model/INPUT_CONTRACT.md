@@ -49,7 +49,7 @@ The Gait exporter now writes its `labels.csv` identity values directly. Its opti
 
 ## 4. Required NPZ arrays
 
-Each NPZ must be self-contained and contain exactly these required logical fields (additional fields are ignored):
+Each NPZ must be self-contained and contain these required logical fields (additional fields are ignored). **There is no legacy fallback:** artifacts missing the contract fields below are rejected.
 
 | key | dtype | shape | meaning |
 |---|---|---|---|
@@ -58,6 +58,11 @@ Each NPZ must be self-contained and contain exactly these required logical field
 | `pts` | `int64` | `[T]` | presentation timestamps in `time_base` ticks |
 | `frame_duration` | positive `int64` | `[T]` | actual native presentation duration in ticks for each frame |
 | `time_base` | `int64` | `[2]` | `[numerator, denominator]`, representing seconds per tick |
+| `input_contract_version` | `int64` | scalar or size-1 | exactly `1` |
+| `display_width` | `int64` | scalar or size-1 | exactly `512` normalized display pixels |
+| `display_height` | `int64` | scalar or size-1 | exactly `512` normalized display pixels |
+| `fps_num` | `int64` | scalar or size-1 | exactly `15` |
+| `fps_den` | `int64` | scalar or size-1 | exactly `1` |
 
 Requirements:
 
@@ -65,10 +70,12 @@ Requirements:
 - `row_share.shape == delta_row_share.shape == (T, R)`.
 - `pts` must be strictly increasing in presentation order. Negative, positive, and nonzero initial PTS are valid.
 - `time_base[0] > 0`, `time_base[1] > 0`; every `frame_duration > 0`.
+- Timing is fixed and exact, not a floating FPS approximation: for every `i`, `frame_duration[i] * time_base == 1/15` and `(pts[i] - pts[0]) * time_base == i/15`, as rational values. This includes the final frame duration. The encoder must select an exactly compatible output clock; WPP never invents durations or resamples timestamps.
+- `512x512` describes the normalized encoded display, not the original source dimensions. Upstream performs aspect-preserving resize-to-fill followed by center crop before HEVC/WPP, and ordinary frame dropping/duplication to constant 15 fps; this classifier does none of those operations.
 - Both floating arrays must be finite. Numeric zero is valid feature data, never a padding marker.
-- Extra NPZ keys are ignored. No MP4, `metadata.json`, FFprobe, packet timing sidecar, source/generator/prompt ID, encoder provenance, or external corpus metadata is required.
+- Extra NPZ keys are ignored. No MP4, `metadata.json`, FFprobe, packet timing sidecar, source/generator/prompt ID, encoder provenance, or external corpus metadata is required by this classifier. Upstream separately records original and normalized provenance in its manifests/metadata.
 
-These required timing fields are a **new external packaging/extractor responsibility**. Existing feature artifacts are not assumed compatible and this folder provides no converter.
+These required timing and media-contract fields are an **external packaging/extractor responsibility**. Existing feature artifacts and checkpoints are incompatible by design; this folder provides no converter or silent legacy fallback.
 
 ## 5. Internal windowing semantics
 
@@ -105,8 +112,13 @@ np.savez(
     "video_example.npz",
     row_share=np.asarray([[0.4, 0.6], [0.5, 0.5]], dtype=np.float32),
     delta_row_share=np.asarray([[0.0, 0.0], [0.1, -0.1]], dtype=np.float32),
-    pts=np.asarray([100, 140], dtype=np.int64),
-    frame_duration=np.asarray([40, 40], dtype=np.int64),
-    time_base=np.asarray([1, 1000], dtype=np.int64),
+    pts=np.asarray([100, 101], dtype=np.int64),
+    frame_duration=np.asarray([1, 1], dtype=np.int64),
+    time_base=np.asarray([1, 15], dtype=np.int64),
+    input_contract_version=np.asarray(1, dtype=np.int64),
+    display_width=np.asarray(512, dtype=np.int64),
+    display_height=np.asarray(512, dtype=np.int64),
+    fps_num=np.asarray(15, dtype=np.int64),
+    fps_den=np.asarray(1, dtype=np.int64),
 )
 ```

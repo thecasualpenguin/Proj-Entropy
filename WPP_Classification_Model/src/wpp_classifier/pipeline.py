@@ -8,7 +8,9 @@ from torch.nn import functional as F
 from .data import load_split,fit_normalizer,transform,make_windows,provenance,infer_label_mapping,sha256,mapping_sha256
 from .models import make_model,aggregate_logits
 from .reporting import atomic_json,save_evaluation,save_curves,metrics,best_observed_history
-from .config import validate_run_name
+from .config import validate_run_name, INPUT_CONTRACT, exact_seconds
+
+CHECKPOINT_VERSION=4
 
 def now(): return datetime.now(timezone.utc).isoformat()
 def seed_all(n): random.seed(n);np.random.seed(n);torch.manual_seed(n);torch.cuda.manual_seed_all(n) if torch.cuda.is_available() else None
@@ -42,7 +44,11 @@ def training_label_mapping(cfg):
 
 def materialize_cfg(cfg,mapping):
  """Return a snapshot config without mutating the caller's parsed source config."""
- out=copy.deepcopy(cfg); out['classes']={'label_mode':mapping['mode'],'class_names':list(mapping['class_names']),
+ out=copy.deepcopy(cfg); out['input_contract']=copy.deepcopy(INPUT_CONTRACT)
+ # Programmatic callers may start from DEFAULT rather than load_config().
+ # Persist the same exact finite ConvTran bound in that case too.
+ if 'convtran_max_frames' not in out['model']: out['model']['convtran_max_frames']=(exact_seconds(out['model']['window_seconds'])*15).__ceil__()
+ out['classes']={'label_mode':mapping['mode'],'class_names':list(mapping['class_names']),
                                         'label_mapping':copy.deepcopy(mapping)}
  weights=out['training']['class_weights']
  if isinstance(weights,list) and len(weights)!=len(mapping['class_names']): raise ValueError('training.class_weights vector must have one value per class')
@@ -110,24 +116,21 @@ def evaluate(model,videos,cfg,dev,weight=None):
  m,_,_=metrics(ys,ps,np.asarray(probs),cfg['classes']['class_names']);m['weighted_ce']=float(np.mean(losses));return m,ys,ps,np.asarray(probs)
 
 def checkpoint_payload(model,opt,scaler,epoch,cfg,metas,norm,best,bad,label_mapping,history):
- return {'version':3,'epoch':epoch,'model':model.state_dict(),'optimizer':opt.state_dict(),'scaler':scaler.state_dict(),'rng':rng(),'config':cfg,'label_mapping':label_mapping,'provenance':provenance(metas),'inputs':metas,'normalizer':norm,'best':best,'bad_epochs':bad,'history':copy.deepcopy(history)}
+ return {'version':CHECKPOINT_VERSION,'epoch':epoch,'model':model.state_dict(),'optimizer':opt.state_dict(),'scaler':scaler.state_dict(),'rng':rng(),'config':cfg,'label_mapping':label_mapping,'provenance':provenance(metas),'inputs':metas,'normalizer':norm,'best':best,'bad_epochs':bad,'history':copy.deepcopy(history)}
 
 def _load_resume(path,cfg,metas,model,opt,scaler,label_mapping=None):
  ck=torch.load(path,map_location='cpu',weights_only=False)
- saved_mapping=ck.get('label_mapping') or indexed_label_mapping(_checkpoint_config(ck.get('config',{})))
+ if ck.get('version') != CHECKPOINT_VERSION: raise ValueError('resume rejected: checkpoint predates the strict input-media contract')
+ saved_mapping=ck.get('label_mapping')
+ if saved_mapping is None: raise ValueError('resume rejected: checkpoint lacks strict-schema label mapping')
  if label_mapping is not None and saved_mapping != label_mapping: raise ValueError('resume rejected: regenerated training label mapping differs from checkpoint')
  if ck.get('provenance')!=provenance(metas):raise ValueError('resume rejected: supplied CSV or NPZ input content hashes changed')
  if _checkpoint_config(ck.get('config',{}))!=cfg:raise ValueError('resume rejected: configuration changed')
  model.load_state_dict(ck['model']);opt.load_state_dict(ck['optimizer']);scaler.load_state_dict(ck.get('scaler',{}));restore(ck['rng']);return ck
 
 def _checkpoint_config(cfg):
- """Normalize pre-v2 indexed checkpoints so existing binary runs remain readable."""
- out=copy.deepcopy(cfg)
- if isinstance(out.get('classes'),dict) and 'label_mode' not in out['classes']:
-  out['classes']['label_mode']='indexed'
- if isinstance(out.get('classes'),dict) and 'label_mapping' not in out['classes']:
-  out['classes']['label_mapping']=indexed_label_mapping(out)
- return out
+ """Return a strict-schema checkpoint config; legacy config migration is forbidden."""
+ return copy.deepcopy(cfg)
 
 def _history_rows(value):
  """Accept only contiguous current-schema epoch rows, never silently truncate."""
@@ -161,7 +164,7 @@ def _canonical_evaluation_exists(run):
 def _resume_run_name(resume):
  """Read the concrete run name from a current checkpoint before comparing configs."""
  ck=torch.load(resume,map_location='cpu',weights_only=False)
- if ck.get('version') != 3: raise ValueError('resume rejected: only current-schema checkpoints are supported')
+ if ck.get('version') != CHECKPOINT_VERSION: raise ValueError('resume rejected: checkpoint predates the strict input-media contract')
  saved=ck.get('config')
  name=saved.get('run',{}).get('name') if isinstance(saved,dict) else None
  try: validate_run_name(name)
@@ -245,10 +248,10 @@ def train(source_cfg,resume=None,run_name=None):
  atomic_json(testdir/'summarized_metrics.json',summary);atomic_json(run/'status.json',{'schema_version':1,'state':terminal_state,'started_at':started_at,'completed_at':now(),'completed_epochs':len(history),'best_epoch':best['epoch'],'selection':cfg['training']['monitor'],'best_validation_score':best['score'],'best_validation_weighted_ce':best['weighted_ce'],'stop_reason':stop_reason});return run
 
 def _mapping_from_checkpoint(ck):
+ if ck.get('version') != CHECKPOINT_VERSION: raise ValueError('evaluation rejected: checkpoint predates the strict input-media contract')
  mapping=ck.get('label_mapping')
- if mapping is not None:return mapping
- # Old indexed checkpoints did not serialize this object but retain their class order.
- return indexed_label_mapping(_checkpoint_config(ck['config']))
+ if mapping is None: raise ValueError('evaluation rejected: checkpoint lacks strict-schema label mapping')
+ return mapping
 
 def eval_checkpoint(source_cfg,checkpoint,output):
  ck=torch.load(checkpoint,map_location='cpu',weights_only=False);mapping=_mapping_from_checkpoint(ck)
