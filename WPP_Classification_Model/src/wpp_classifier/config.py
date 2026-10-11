@@ -5,7 +5,7 @@ from fractions import Fraction
 from pathlib import Path
 import yaml
 
-DEFAULT = {"run":{"output_root":"runs", "name":"wpp_run"},
+DEFAULT = {"run":{"output_root":"runs", "name":None},
  "model":{"architecture":"transformer", "window_seconds":2, "width":64, "d_model":64, "heads":4, "layers":2, "dropout":0.1, "resnet_blocks":3},
  "training":{"seed":0,"learning_rate":0.001,"batch_size":1,"max_epochs":20,"patience":5,"device":"auto","amp":False,"gradient_accumulation":1,"class_weights":"none","monitor":"macro_f1"}}
 REQUIRED_PATHS=("train_data_path","train_label_path","val_data_path","val_label_path","test_data_path","test_label_path")
@@ -61,8 +61,16 @@ def load_config(path):
     if isinstance(t['class_weights'],list) and cfg['classes']['class_names'] is not None and len(t['class_weights'])!=len(cfg['classes']['class_names']): raise ValueError("training.class_weights vector must have one value per class")
     if not isinstance(t['amp'],bool): raise ValueError("training.amp must be a boolean")
     if t['monitor'] not in ('macro_f1','weighted_ce'): raise ValueError("training.monitor must be macro_f1 or weighted_ce")
-    cfg['_config_path']=str(path); cfg['run']['output_root']=str(resolve_path(path.parent,cfg['run']['output_root']))
+    cfg['_config_path']=str(path)
+    cfg['run']['output_root']=str(Path(str(cfg['run']['output_root'])).expanduser().resolve())
+    validate_run_name(cfg['run']['name'])
     return cfg
+
+def validate_run_name(name):
+    """Accept an optional, single native path component for a run directory."""
+    if name is None: return
+    if not isinstance(name,str) or Path(name).name != name or name in ('', '.', '..'):
+        raise ValueError('run name must be a single safe path component')
 
 def resolve_path(base,value):
     p=Path(str(value)).expanduser()

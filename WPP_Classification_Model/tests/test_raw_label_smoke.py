@@ -36,19 +36,19 @@ class RawLabelSmokeTest(unittest.TestCase):
    root=Path(tmp);self._dataset(root)
    for architecture in ('resnet','transformer'):
     cfg=self._config(root,f'{device}_{architecture}',architecture,device); source_before=copy.deepcopy(cfg)
-    run=train(cfg); latest=run/'checkpoints'/'latest.pt'; canonical=run/'test_evaluation'/'test_metrics.json'
+    run=train(cfg); latest=run/'checkpoints'/'latest.pt'; canonical=run/'evaluations'/'summarized_metrics.json'
     mapping=json.loads((run/'label_mapping.json').read_text(encoding='utf8'))
     self.assertEqual(mapping['class_names'],['001','016','124'])
     self.assertEqual(cfg,source_before)  # Runtime snapshotting never mutates source config.
-    report=json.loads(canonical.read_text(encoding='utf8'))
-    self.assertEqual([row['class_name'] for row in report['per_class']],['001','016','124'])
-    self.assertEqual(report['per_class'][1]['support'],1)
+    report=json.loads((run/'evaluations'/'test_per_class_metrics.json').read_text(encoding='utf8'))
+    self.assertEqual([row['class'] for row in report],['001','016','124'])
+    self.assertEqual(report[1]['sample_count'],1)
     # Latest checkpoint can be verified/resumed after completion without changing the canonical test.
     canonical_before=canonical.read_bytes();self.assertEqual(train(cfg,latest),run)
     self.assertEqual(canonical.read_bytes(),canonical_before)
     manual=root/f'manual_{architecture}';self.assertTrue(eval_checkpoint(cfg,latest,manual).is_dir())
-    with self.assertRaisesRegex(ValueError,'canonical test_evaluation'):
-     eval_checkpoint(cfg,latest,run/'test_evaluation')
+    with self.assertRaisesRegex(ValueError,'canonical evaluations'):
+     eval_checkpoint(cfg,latest,run/'evaluations')
     # The run-side mapping and checkpoint-side mapping are both tamper guards before weight use.
     mapping_path=run/'label_mapping.json'; mapping_before=mapping_path.read_bytes();mapping_path.write_text('{not-json',encoding='utf8')
     with self.assertRaisesRegex(ValueError,'unreadable run label_mapping'):
@@ -78,8 +78,8 @@ class RawLabelSmokeTest(unittest.TestCase):
  def test_single_raw_class_is_supported_and_reports_null_auc(self):
   with tempfile.TemporaryDirectory() as tmp:
    root=Path(tmp);self._dataset(root,('016',));cfg=self._config(root,'single','transformer','cpu');cfg['training'].update(max_epochs=1,patience=1)
-   run=train(cfg);report=json.loads((run/'test_evaluation'/'test_metrics.json').read_text(encoding='utf8'))
-   self.assertEqual(report['per_class'][0]['class_name'],'016')
-   self.assertIsNone(report['per_class'][0]['roc_auc'])
-   self.assertIsNone(report['per_class'][0]['average_precision'])
+   run=train(cfg);report=json.loads((run/'evaluations'/'test_per_class_metrics.json').read_text(encoding='utf8'))
+   self.assertEqual(report[0]['class'],'016')
+   self.assertIsNone(report[0]['roc_auc'])
+   self.assertIsNone(report[0]['average_precision'])
 if __name__=='__main__':unittest.main()
