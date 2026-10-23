@@ -1,85 +1,161 @@
-# Standalone WPP multiclass video classifier
+# Native flat-WPP classification
 
-A self-contained PyTorch classifier for **one class label per whole video** from native WPP NPZs. It is independent of the encoder/extractor and of `Video_Classification_Model`; it does not create splits, infer corpus/source/prompt metadata, rebalance data, or read MP4/sidecar files.
+This directory trains the native `src.wpp_transformer.WPPTransformer` on a
+ledger-verified bounded WPP bundle. It is not the packet-CSV pipeline: copied
+ResNet, packet extraction, linear-probe, CSV-split, and legacy Transformer
+entrypoints were removed. The maintained alternative for that workflow remains
+unchanged in `Video_Classification_Model/`.
 
-`INPUT_CONTRACT.md` is authoritative for inputs and exact timing semantics. In particular, callers provide all six explicit CSV paths, CSVs join by `video_id` (not row order), and each feature path is one self-contained NPZ. Every NPZ must verify contract version 1, normalized `512x512` display, and an exact `15/1` fps clock (including every final-frame duration); legacy artifacts are rejected. The included example CSVs are illustrative only: their NPZs are deliberately absent and therefore `configs/example.yaml` is **not runnable**.
+## Required inputs
 
-## Install
+Training accepts only three explicit, trusted inputs:
 
-Use Python 3.10+ with PyTorch, NumPy, scikit-learn, PyYAML, and matplotlib (the project environment already supplies these):
+1. a bundle published by `pack_wpp_dataset.py`;
+2. its complete approved source manifest; and
+3. its native extraction index.
 
-```sh
-python -m pip install torch numpy scikit-learn PyYAML matplotlib
-```
+`WPPDatasetBundle` validates the live source/index contracts, the index-bound
+ledger, all six bundle CSV checksums, source coverage, partitions, group rules,
+and the exact training-derived class mapping before training begins. There is no
+automatic split, relabeling, deduplication, or fallback to self-declared bundle
+metadata. Train and validation must be nonempty; test may be empty, but an
+explicit evaluation of an empty partition fails.
 
-## Run
+A complete DeepAction extraction/packed bundle is **not** included or claimed.
+Do not run the dataset-wide extraction, packing, or training commands without
+separate approval.
 
-`data` paths in YAML resolve relative to the YAML file; `features_path` resolves relative to its data CSV. In contrast, `run.output_root` resolves relative to the process working directory (so `runs` is `./runs` where the command is launched). On a native Windows run, native absolute Windows paths are accepted.
+## Native upstream chain
 
-```sh
-python run_pipeline.py train --config /absolute/path/to/config.yaml
-python run_pipeline.py train --config configs/example.yaml --run-name experiment_01
-python run_pipeline.py train --config configs/example.yaml --run-name experiment_01 \
-  --resume runs/experiment_01/checkpoints/latest.pt
-# An extra evaluation must use a fresh directory; canonical test output is protected.
-python run_pipeline.py evaluate --config /absolute/path/to/config.yaml \
-  --checkpoint runs/my_run/checkpoints/best.pt --output runs/my_run/manual_evaluation
-```
+`build_manifest_contract.py` and `src/{manifest_contract,deepaction_manifest}.py`
+publish original-source contracts. `build_native_wpp_extraction.py` and
+`src/native_wpp_workflow.py` produce a ledger-bound extraction index;
+`verify_native_wpp_extraction.py` verifies it. `pack_wpp_dataset.py` and
+`src/wpp_dataset.py` publish/load the bounded video-aware input. These stages
+remain separately documented in:
 
-Training uses only supplied train/validation splits to select a checkpoint, then evaluates the supplied test split once into `evaluations/`. `evaluate` will not overwrite that canonical directory. Resume rejects any config, CSV, mapping, or NPZ-content-hash changes. A completed canonical test is immutable: resuming its latest checkpoint is allowed only as a no-op verification; additional epochs must resume an interrupted pre-test run.
+- `docs/manifest-contracts.md`
+- `docs/bounded-wpp-dataset.md`
+- `docs/wpp-flat-transformer.md`
 
-## Configuration
-
-`data` contains exactly the six paths shown in `configs/example.yaml`. `run.output_root` defaults to `runs`; `run.name` is optional and defaults to a `run_YYYYMMDD_HHMMSS` timestamp. `--run-name` takes precedence over `run.name`. Names must be a single safe path component, and a new run never overwrites an existing directory. When resuming, an omitted name reuses the checkpoint's persisted name; the effective name (CLI override, otherwise YAML) must match the checkpoint. Repeat `--run-name` on resume if it originally overrode a configured name. The minimal raw-label configuration is just those six paths (no `classes` mapping):
-
-```yaml
-data:
-  train_data_path: train_data.csv
-  train_label_path: train_labels.csv
-  val_data_path: val_data.csv
-  val_label_path: val_labels.csv
-  test_data_path: test_data.csv
-  test_label_path: test_labels.csv
-```
-
-By default `classes.class_names` is omitted: labels are CSV text (for example person IDs `001`, `016`, `124`) and the sorted, `str.strip().casefold()` canonical training labels become the ordered vocabulary. Leading zeroes are retained. Only training labels define classes; unknown validation/test labels are rejected, while known classes absent in either split remain reported with support zero.
-
-For old indexed CSVs, provide a nonempty `classes.class_names` list. This compatibility mode preserves the prior requirement for exact integer labels `0..C-1` and preserves its display order. Do not combine that legacy list with person-ID label CSVs. Each run writes `label_mapping.json`, and each checkpoint embeds the exact mapping; resume verifies a regenerated train mapping before loading weights, and standalone evaluation uses the checkpoint mapping rather than inferring from test labels.
-
-### Audited DeepAction source-label export
-
-`export_deepaction_splits.py` is the one-purpose, read-only packager/exporter for the approved DeepAction WPP cache. It verifies cache/encoded hashes, obtains integer packet durations and time bases from each existing encoded MP4, requires their presentation-sorted PTS to exactly equal the existing NPZ display-order PTS, and writes fresh timing-complete NPZ **copies** plus six CSV tables and audits. Legacy feature arrays are retained exactly; no source cache, metadata, manifest, or encoding is changed. Source names are emitted directly as raw labels; it never uses the legacy binary `label` or `label_id` fields. The output directory must not already exist and may not overlap the source cache. Publication requires atomic `renameat2(RENAME_NOREPLACE)` no-clobber support; unsupported filesystems fail closed rather than risk overwriting a newly created output path.
+Native extraction is fresh by default. Resume only an owned interrupted build with its exact same manifest/profile/runtime fingerprint:
 
 ```sh
-/home/naoromi/miniforge3/envs/entropy/bin/python export_deepaction_splits.py
+python build_native_wpp_extraction.py --source-manifest /path/manifest --source-root /path/originals \
+  --output-dir /outside/native-build --resume --producer-dir /path/entropy-cabac-wpp
+# Terminal extraction failures remain terminal unless explicitly retried:
+python build_native_wpp_extraction.py --source-manifest /path/manifest --source-root /path/originals \
+  --output-dir /outside/native-build --resume --retry-failed --producer-dir /path/entropy-cabac-wpp
 ```
 
-The default target is `/mnt/d/projects/proj-entropy/deepaction_wpp_source_splits_transformer_seed42`. It reproduces the adapter's seed-42 prompt grouping (sorted canonical prompt IDs, local shuffle, Python `round`, and clamps), so variants sharing a prompt never cross train/validation/test. Review `split_audit.json`, `prompt_assignments.csv`, and `coverage_counts.csv` before putting the six generated paths into a training config.
+`--resume` is a verified no-op for a compatible finalized build (no journal mtime change); terminal failures remain terminal unless `--retry-failed` is explicit. Do not point resume at a different manifest (including the 21-video pilot versus a full retained manifest), alter producer scripts/runtime, or remove a build lock while a writer may be alive. Linux descriptor pinning protects child input/output pathname publication, but not a same-UID actor that can rewrite all owned files. See `docs/manifest-contracts.md` for recovery, receipt inventory, and finalization behavior.
 
-Defaults: Transformer (`d_model: 64`, `heads: 4`, `layers: 2`, dropout `.1`), or `architecture: resnet` (width 64, three residual temporal blocks). A third choice, `architecture: convtran`, is an **adapted ConvTran**: it keeps ConvTran tAPE and post-softmax eRPE temporal attention, but replaces the fixed sensor tokenizer with masked local spatial-temporal convolutions over native `[T,R,2]` WPP rows followed by learned masked spatial reduction. It accepts variable row counts directly; it never pre-averages rows. `convtran_layers`, `convtran_heads`, `convtran_ff_multiplier`, and odd `convtran_kernel_size` configure only this architecture. Its finite tAPE/eRPE tables are derived exactly as `ceil(window_seconds * 15)`, so over-bound windows fail rather than truncate; short terminal windows are valid. See `configs/example_convtran.yaml`.
+## Training and normalization
 
-`model.window_seconds` is exact: use an integer (`2`) or a quoted string (`"1.5"`, `"3/2"`), never a YAML float. Frames are bucketed by native PTS, each frame exactly once, and full frame duration is used to aggregate window logits into one video logit.
+Copy `configs/example.yaml`, set all paths to fresh explicit locations, then:
 
-Useful `training` values are `max_epochs`, `learning_rate`, `batch_size`, `gradient_accumulation`, `patience`, `device` (`auto`, `cpu`, `cuda`), `class_weights` (`none`, `inverse_frequency`, or a positive C-length vector), and `monitor` (`macro_f1` or `weighted_ce`). One optimizer update covers `batch_size * gradient_accumulation` videos; a tail uses its actual video count. On OOM, only retry microbatching is reduced: the full update group and all frames remain unchanged. No balancing is automatic.
+```sh
+cd WPP_Classification_Model
+python run_pipeline.py train --config /path/to/native-wpp.yaml
+```
 
-## Outputs and metric convention
+The default model is the existing flat WPP Transformer: patch 16, width 32,
+four heads, two pre-LN GELU layers, feed-forward width 64, dropout 0.2. Batch
+size defaults to one (the only measured model smoke was batch one); training is
+FP32 with no AMP or attention-kernel override. `auto` selects CUDA when
+available, otherwise CPU; `cpu` or `cuda[:N]` may be explicit. The runner owns
+dictionary batches and currently requires `num_workers: 0`.
 
-The run directory stores `config.json` (including the concrete generated or overridden run name, strict media contract, and derived ConvTran temporal bound), train-only `normalizer.json`, input/feature content hashes, `checkpoints/{best,latest}.pt`, and `status.json`. Checkpoints from before this strict media contract are deliberately incompatible and rejected. Canonical reporting is written only to `evaluations/`: `per_epoch_metrics.csv/json`, `loss_curves.png`, `accuracy_curves.png`, `precision_curves.png`, `recall_curves.png`, `f1_curves.png`, `summarized_metrics.json`, and test per-class/confusion-matrix CSV/PNG files. `status.json` records completion, epoch count, checkpoint selection, and whether training stopped by patience or max epochs.
+Normalization is fixed and checkpointed: a mergeable Welford float64 population
+mean/std is fitted once from **valid train cells only**. Explicit row/time masks,
+not values, determine validity; observed zeros participate, all padding is
+excluded and written back as zero. Validation/test use the frozen train
+statistics. Nonfinite valid values, no valid training cells, or zero/invalid
+population variance fail. There is no epsilon, log transform, clipping, or
+per-row normalization.
 
-`summarized_metrics.json` contains the canonical test metrics plus provenance, normalizer and checkpoint references, selection details, and `best_observed_per_epoch_metrics`. The latter independently records the maximum value and earliest epoch on ties for every one of the seven train and validation classification metrics; it is not checkpoint selection. `checkpoint_selection` separately records the selected checkpoint epoch and its train/validation metrics. The selected checkpoint continues to use configurable validation `macro_f1` maximization or validation weighted cross-entropy minimization.
+The upstream partitions are used exactly. Each video is one cross-entropy
+example regardless of its WPP-row count; masks retain variable row counts and
+frame lengths. Validation loss alone drives scheduler/early stopping and
+`best.pt`; test is never used for selection or statistics.
 
-The seven headline values are `accuracy`, macro/weighted precision, macro/weighted recall, and macro/weighted F1. Macro and weighted averages use only classes present in that split's ground truth (while per-class files retain every configured class); predictions to absent configured classes remain errors. Precision/recall/F1 use `zero_division=0`; absent-class ROC/AP is `null` with a reason, never dropped. Epoch train metrics are **online** predictions made while shuffled training examples are in `model.train()` and optimizer updates occur; validation and standalone checkpoint evaluation use `model.eval()`. Thus an epoch train value is intentionally not a second, post-epoch inference pass.
+## Resume and evaluate
 
-Normalization is a train-only streaming mean/std for `[delta_row_share, row_share]` over valid native cells. Explicit masks—not feature zeros—represent padding. No resizing, interpolation, truncation, or delta reset occurs.
+```sh
+python run_pipeline.py resume --run /fresh/outside-checkout/native-wpp-run
+python run_pipeline.py evaluate \
+  --checkpoint /fresh/outside-checkout/native-wpp-run/checkpoints/best.pt \
+  --config /path/to/native-wpp.yaml --partition test \
+  --output-dir /fresh/outside-checkout/native-wpp-evaluation
+```
+
+Runs require a fresh `run.output_dir`; evaluation requires a fresh output
+directory. Resume accepts only an explicit epoch-boundary native checkpoint in
+that run. It revalidates bundle/source/index/ledger provenance, class mapping,
+model configuration, immutable normalization policy/statistics, and all
+hyperparameters except a larger `max_epochs`, device, or `num_workers` (which
+remains zero). It restores optimizer/scheduler, Python/NumPy/Torch CPU/CUDA RNG
+and shuffle-generator state, and never refits normalization.
+
+Checkpoints are `native_wpp_checkpoint` v1.0 payloads containing only primitive
+containers and tensors and load through `torch.load(weights_only=True)`;
+legacy checkpoints are rejected. `last.pt`, `best.pt`, and periodic epoch files
+are atomically published. JSON status, provenance, history, and sample-weighted
+cross-entropy/classification metrics are written under the fresh run. Completion
+may write one post-selection test report; standalone evaluation never optimizes
+or changes saved statistics.
+
+## Evaluation artifacts and historical exports
+
+On completion, the selected `best.pt` atomically publishes the compatible
+fourteen-file `evaluations/` set (and nothing else in that directory):
+per-epoch JSON/CSV; loss, accuracy, precision, recall, and F1 curves; a
+canonical summary; per-class JSON/CSV; and raw/row-normalized confusion-matrix
+CSV/PNG files. Native backward-compatible test data is written separately as
+run-root `native_test_metrics.json`; older completed runs retaining
+`evaluations/test.json` are only read by export compatibility code. Managed run
+reports record checksums/ownership in root `.native-wpp-evaluations-state.json`.
+A legitimate larger-epoch resume archives its prior owned generation under
+`.native-wpp-evaluations-archives/` and journal-publishes a new one; foreign,
+corrupt, or symlinked report trees are rejected before optimizer/history changes. The seven aggregate metrics are accuracy plus
+macro/weighted precision, recall, and F1. Aggregates use classes present in the
+truth split; per-class and confusion reports retain the complete configured
+class order. Test reporting is only post-selection `best.pt` inference.
+
+Future epoch records contain online train metrics from the same pre-update
+training forwards (no extra train pass), post-scheduler LR, and the measured
+train/validation/scheduler duration. A standalone `evaluate` output retains its
+native `metrics.json` and also contains a compatible `evaluations/` directory.
+
+To report an older completed run without changing any source-run byte, publish
+into a new sibling directory:
+
+```sh
+python run_pipeline.py export-report \
+  --run /outside/native-wpp-run \
+  --output-dir /outside/native-wpp-run-video-format \
+  --reconstruct-train-metrics --device cuda
+```
+
+With `--reconstruct-train-metrics`, export checks every required epoch
+checkpoint with the safe native contract and reuses its embedded frozen train
+statistics. Without that flag it validates only the selected `best.pt`.
+Reconstructed train metrics are post-epoch `eval()` snapshots, not the
+unavailable original online train metrics; this distinction, unchanged
+historical train CE, unavailable duration, and checkpoint-derived LR are
+recorded in root `report_provenance.json`. The source run, checkpoints, history,
+and existing native test JSON are read only. Omitting
+`--reconstruct-train-metrics` leaves unavailable historical train classification
+values null. Report numeric values must be finite; only explicitly unavailable
+historic fields are represented as JSON null.
 
 ## Tests
 
 ```sh
+cd WPP_Classification_Model
 python -m unittest discover -s tests -v
 ```
 
-Tests create temporary synthetic NPZs; they do not train on project data or alter external encoder/extractor artifacts.
-
-## ConvTran attribution
-
-The ConvTran attention design is adapted from [Navid Fouladi's ConvTran](https://github.com/Navidfoumani/ConvTran), licensed MIT. This repository contains a clean, minimal WPP-specific implementation rather than copied upstream source; its native-row tokenizer and mask handling are local code. See `THIRD_PARTY_NOTICES.md`.
+Tests use small synthetic contract/index/bundle fixtures and tiny CPU model
+smokes. They do not encode video, pack an authoritative dataset, or train a full
+dataset.

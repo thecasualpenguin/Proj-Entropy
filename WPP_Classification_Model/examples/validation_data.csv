@@ -1,4 +1,0 @@
-video_id,features_path
-validation_video_001,features/validation_video_001.npz
-validation_video_002,features/validation_video_002.npz
-validation_video_003,features/validation_video_003.npz

@@ -1,5 +1,6 @@
-torch
+# Native WPP contracts, bundle loader, flat Transformer, and runner.
 numpy
 scikit-learn
-PyYAML
 matplotlib
+PyYAML
+torch

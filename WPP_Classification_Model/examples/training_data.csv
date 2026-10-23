@@ -1,7 +1,0 @@
-video_id,features_path
-train_video_001,features/train_video_001.npz
-train_video_002,features/train_video_002.npz
-train_video_003,features/train_video_003.npz
-train_video_004,features/train_video_004.npz
-train_video_005,features/train_video_005.npz
-train_video_006,features/train_video_006.npz
