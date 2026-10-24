@@ -168,12 +168,8 @@ class WPPTransformer(nn.Module):
         ).unfold(1, self.patch_size, self.patch_size).any(dim=-1)
         return (row_mask[:, :, None] & patch_time_mask[:, None, :]).reshape(row_mask.shape[0], -1)
 
-    def forward(self, values: Tensor, row_mask: Tensor, time_mask: Tensor, *, normalized: bool = False) -> Tensor:
-        """Classify raw nonnegative values, or runner-normalized valid cells.
-
-        ``normalized=True`` is reserved for the native runner after its frozen
-        train-only transform; masks retain the same semantics in either mode.
-        """
+    def _forward_impl(self, values: Tensor, row_mask: Tensor, time_mask: Tensor, *, normalized: bool,
+                      capture_attention_inputs: bool) -> tuple[Tensor, list[Tensor]]:
         self._validate_inputs(values, row_mask, time_mask, normalized=normalized)
         valid_cells = row_mask[:, :, None] & time_mask[:, None, :]
         # ``where`` is essential: invalid padding may intentionally carry NaN or
@@ -191,12 +187,38 @@ class WPPTransformer(nn.Module):
         tokens = torch.where(token_mask[:, :, None], tokens, torch.zeros((), device=tokens.device, dtype=tokens.dtype))
         tokens = self.input_dropout(tokens)
         padding_mask = ~token_mask
+        attention_inputs: list[Tensor] = []
         # Every layer receives one flattened R*ceil(3000/P) sequence, never a
-        # per-row classification or hierarchical pre-pooling stage.
+        # per-row classification or hierarchical pre-pooling stage.  The trace
+        # path merely evaluates norm1 once to retain the exact Q/K input; it
+        # leaves the subsequent native layer call, masks, and fast paths alone.
         for layer in self.layers:
+            if capture_attention_inputs:
+                attention_inputs.append(layer.norm1(tokens).detach())
             tokens = layer(tokens, src_key_padding_mask=padding_mask)
             tokens = torch.where(token_mask[:, :, None], tokens, torch.zeros((), device=tokens.device, dtype=tokens.dtype))
         tokens = self.norm(tokens)
         tokens = torch.where(token_mask[:, :, None], tokens, torch.zeros((), device=tokens.device, dtype=tokens.dtype))
         pooled = tokens.sum(dim=1) / token_mask.sum(dim=1, keepdim=True).to(dtype=tokens.dtype)
-        return self.head(pooled)
+        return self.head(pooled), attention_inputs
+
+    def forward(self, values: Tensor, row_mask: Tensor, time_mask: Tensor, *, normalized: bool = False) -> Tensor:
+        """Classify raw nonnegative values, or runner-normalized valid cells.
+
+        ``normalized=True`` is reserved for the native runner after its frozen
+        train-only transform; masks retain the same semantics in either mode.
+        """
+        return self._forward_impl(values, row_mask, time_mask, normalized=normalized,
+                                  capture_attention_inputs=False)[0]
+
+    def forward_with_attention_inputs(self, values: Tensor, row_mask: Tensor, time_mask: Tensor, *,
+                                      normalized: bool = False) -> tuple[Tensor, list[Tensor]]:
+        """Run native inference and return detached pre-attention norm1 inputs.
+
+        This deliberately uses no hooks and does not request attention weights;
+        callers must use ``eval()`` so dropout cannot make the trace ambiguous.
+        """
+        if self.training:
+            raise RuntimeError("forward_with_attention_inputs requires eval mode")
+        return self._forward_impl(values, row_mask, time_mask, normalized=normalized,
+                                  capture_attention_inputs=True)

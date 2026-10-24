@@ -1,0 +1,2 @@
+# Optional interactive controls for notebooks/wpp_explorer.ipynb
+ipywidgets>=8,<9
