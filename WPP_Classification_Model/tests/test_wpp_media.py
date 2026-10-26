@@ -14,10 +14,35 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from src.native_wpp_workflow import PresentationProbe
-from src.wpp_media import MediaError, resolve_source_video, source_media_timing, wpp_row_boxes
+from src.wpp_media import (MediaError, _ffprobe_display_metadata, resolve_source_video,
+                           source_media_timing, wpp_row_boxes)
 
 
 class WPPMediaTests(unittest.TestCase):
+    def test_ffprobe_supports_modern_and_legacy_frame_durations(self):
+        cases = [
+            ({"duration": 7}, Fraction(7, 100)),
+            ({"pkt_duration": 9}, Fraction(9, 100)),
+            ({"duration": 7, "pkt_duration": 9}, Fraction(7, 100)),
+            ({"duration": 0, "pkt_duration": 9}, Fraction(9, 100)),
+            ({"duration": "N/A", "pkt_duration": 9}, Fraction(9, 100)),
+            ({"duration": None, "pkt_duration": 9}, Fraction(9, 100)),
+            ({"duration": -1}, None),
+            ({"duration": 0}, None),
+            ({}, None),
+        ]
+        for fields, expected in cases:
+            with self.subTest(fields=fields):
+                payload = {"streams": [{"time_base": "1/100", "sample_aspect_ratio": "1:1"}],
+                           "frames": [{"media_type": "video", "best_effort_timestamp": 558, **fields}]}
+                with mock.patch("src.wpp_media.shutil.which", return_value="ffprobe"), \
+                     mock.patch("src.wpp_media.subprocess.run", return_value=mock.Mock(stdout=json.dumps(payload))) as run:
+                    rotation, sar, durations = _ffprobe_display_metadata(Path("source.mp4"))
+                self.assertEqual((rotation, sar), (0, "1:1"))
+                self.assertEqual(durations, {} if expected is None else {Fraction(558, 100): expected})
+                entries = run.call_args.args[0][run.call_args.args[0].index("-show_entries") + 1]
+                self.assertIn("best_effort_timestamp,duration,pkt_duration", entries)
+
     def test_source_timing_keeps_pts_origin_and_next_frame_coverage_end(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory); source = root / "class" / "a.mp4"; source.parent.mkdir(); source.write_bytes(b"source")

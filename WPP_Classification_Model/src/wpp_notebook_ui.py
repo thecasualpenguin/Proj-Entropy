@@ -456,8 +456,9 @@ function draw(t){cancelAnimationFrame(raf); if(video.readyState<1)return; const 
 function rawTime(t){return t+Number(data.media_time_offset||0)} function browserTime(t){return Math.max(0,t-Number(data.media_time_offset||0))}
 function update(){const raw=rawTime(video.currentTime);if(raw>=data.covered_end){if(!video.paused){video.pause();video.currentTime=browserTime(data.covered_end)}ctx.clearRect(0,0,canvas.clientWidth,canvas.clientHeight);return;}draw(raw)}
 function schedule(){update();if(!video.paused)raf=requestAnimationFrame(schedule)}
-video.src=data.video.url; video.addEventListener('loadedmetadata',schedule);video.addEventListener('play',schedule);video.addEventListener('pause',update);video.addEventListener('seeked',update);video.addEventListener('timeupdate',update);if(video.requestVideoFrameCallback){(function vf(){video.requestVideoFrameCallback((_,m)=>{updateAt(rawTime(m.mediaTime));vf()})})()}function updateAt(t){if(t>=data.covered_end){update();return;}if(!video.paused)draw(t)}
+video.addEventListener('loadedmetadata',schedule);video.addEventListener('play',schedule);video.addEventListener('pause',update);video.addEventListener('seeked',update);video.addEventListener('timeupdate',update);if(video.requestVideoFrameCallback){(function vf(){video.requestVideoFrameCallback((_,m)=>{updateAt(rawTime(m.mediaTime));vf()})})()}function updateAt(t){if(t>=data.covered_end){update();return;}if(!video.paused)draw(t)}
 video.addEventListener('error',()=>{error.classList.remove('wpp-hidden');error.textContent='The browser could not decode or reach this video URL. Use a Jupyter /files/ URL or an explicit browser-reachable URL; check codec support. Do not use file://. If conversion is necessary, do it explicitly and preserve VFR timestamps.'});
+video.src=data.video.url;
 mode.addEventListener('change',update);opacity.addEventListener('input',update);scrub.addEventListener('input',()=>{video.currentTime=browserTime(data.timestamps[Number(scrub.value)]||0);update()});$('.wpp-prev').onclick=()=>{scrub.value=Math.max(0,Number(scrub.value)-1);scrub.dispatchEvent(new Event('input'))};$('.wpp-next').onclick=()=>{scrub.value=Math.min(Number(scrub.max),Number(scrub.value)+1);scrub.dispatchEvent(new Event('input'))};
 })();</script>'''
 
@@ -471,4 +472,16 @@ def render_explanation_viewer(explanation: Any, *, video_url: str | None = None)
     return _HTML.replace("__PAYLOAD__", html.escape(encoded, quote=True))
 
 
-__all__ = ["ExplorerState", "MAX_MODEL_FRAMES", "build_viewer_payload", "heatmap_data_url", "jupyter_files_url", "render_explanation_viewer"]
+def render_explanation_iframe(explanation: Any, *, video_url: str | None = None) -> str:
+    """Return a widget-safe iframe wrapper for the standalone explanation viewer.
+
+    The sandbox permits scripts and same-origin video access; it is transport
+    isolation for notebook output, not an untrusted-code security boundary.
+    """
+    srcdoc = html.escape(render_explanation_viewer(explanation, video_url=video_url), quote=True)
+    return ('<iframe class="wpp-viewer-frame" title="WPP explanation viewer" '
+            'sandbox="allow-scripts allow-same-origin" srcdoc="' + srcdoc + '" '
+            'style="display:block;width:100%;max-width:960px;height:760px;border:0"></iframe>')
+
+
+__all__ = ["ExplorerState", "MAX_MODEL_FRAMES", "build_viewer_payload", "heatmap_data_url", "jupyter_files_url", "render_explanation_iframe", "render_explanation_viewer"]

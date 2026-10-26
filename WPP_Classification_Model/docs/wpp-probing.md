@@ -103,3 +103,10 @@ fixed scale per overlay; attention maps can declare `stride: 16`.
 The backend's `export_explanation()` remains responsible for durable PNG/SVG
 figures, numeric arrays, and metadata. The HTML viewer is a responsive playback
 UI, not an alternate export format.
+
+### JupyterLab
+
+The explorer displays the viewer through a `widgets.HTML`-hosted sandboxed
+iframe. This preserves the viewer's payload, styles, and scripts when JupyterLab
+sanitizes ordinary `IPython.display.HTML` output; use `render_explanation_iframe()`
+for that transport and `render_explanation_viewer()` for standalone HTML.

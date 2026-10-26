@@ -1,4 +1,5 @@
 import base64
+from html.parser import HTMLParser
 import json
 from pathlib import Path
 import re
@@ -8,7 +9,8 @@ import unittest
 from types import SimpleNamespace
 
 from src.wpp_notebook_ui import (ExplorerState, MAX_MODEL_FRAMES, build_viewer_payload,
-                                  heatmap_data_url, jupyter_files_url, render_explanation_viewer)
+                                  heatmap_data_url, jupyter_files_url, render_explanation_iframe,
+                                  render_explanation_viewer)
 
 
 class WPPNotebookUITests(unittest.TestCase):
@@ -134,12 +136,39 @@ class WPPNotebookUITests(unittest.TestCase):
         self.assertIn("requestVideoFrameCallback", page)
         self.assertIn("indexAt", page)  # preceding-frame/floor lookup is client-side
 
+    def test_iframe_escapes_srcdoc_and_round_trips_standalone_viewer(self):
+        payload = self.payload(video={"url": '/files/</iframe><img src=x onerror=alert(1)>'})
+        standalone = render_explanation_viewer(payload)
+        wrapped = render_explanation_iframe(payload)
+
+        class IframeParser(HTMLParser):
+            attrs: dict[str, str | None] = {}
+
+            def handle_starttag(self, tag, attrs):
+                if tag == "iframe":
+                    self.attrs = dict(attrs)
+
+        parser = IframeParser()
+        parser.feed(wrapped)
+        self.assertEqual(standalone, parser.attrs["srcdoc"])
+        self.assertEqual("allow-scripts allow-same-origin", parser.attrs["sandbox"])
+        self.assertEqual("WPP explanation viewer", parser.attrs["title"])
+        self.assertNotIn("</iframe><img", wrapped)
+
     def test_notebook_is_valid_and_code_cells_parse(self):
         notebook = json.loads((Path(__file__).parents[1] / "notebooks" / "wpp_explorer.ipynb").read_text(encoding="utf-8"))
         self.assertEqual(4, notebook["nbformat"])
         for cell in notebook["cells"]:
             if cell["cell_type"] == "code":
                 compile("".join(cell["source"]), "wpp_explorer.ipynb", "exec")
+
+    def test_notebook_renders_viewer_in_embedded_output_widget(self):
+        notebook = json.loads((Path(__file__).parents[1] / "notebooks" / "wpp_explorer.ipynb").read_text(encoding="utf-8"))
+        setup, callbacks = ("".join(notebook["cells"][index]["source"]) for index in (4, 5))
+        self.assertIn("viewer_output = widgets.Output()", setup)
+        self.assertIn("status, viewer_output]))", setup)
+        self.assertIn("viewer_output.clear_output(wait=True)", setup)
+        self.assertIn("with viewer_output:\n            viewer_output.clear_output(wait=True)\n            display(widgets.HTML", callbacks)
 
 
 if __name__ == "__main__":

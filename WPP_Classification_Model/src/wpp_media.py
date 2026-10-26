@@ -68,7 +68,7 @@ def _ffprobe_display_metadata(source: Path) -> tuple[int, str, dict[Fraction, Fr
         raise MediaError("ffprobe is required to validate source presentation timing; install FFmpeg or provide a supported environment")
     command = [
         executable, "-v", "error", "-select_streams", "v:0", "-show_entries",
-        "stream=sample_aspect_ratio,time_base:stream_tags=rotate:stream_side_data=rotation:frame=media_type,best_effort_timestamp,pkt_duration",
+        "stream=sample_aspect_ratio,time_base:stream_tags=rotate:stream_side_data=rotation:frame=media_type,best_effort_timestamp,duration,pkt_duration",
         "-of", "json", str(source),
     ]
     try:
@@ -103,11 +103,19 @@ def _ffprobe_display_metadata(source: Path) -> tuple[int, str, dict[Fraction, Fr
         if frame.get("media_type") != "video":
             continue
         try:
-            timestamp, duration = int(frame["best_effort_timestamp"]), int(frame["pkt_duration"])
+            timestamp = int(frame["best_effort_timestamp"])
         except (KeyError, TypeError, ValueError):
             continue
-        if duration > 0:
-            durations[Fraction(timestamp) * time_base] = Fraction(duration) * time_base
+        # Newer FFmpeg exposes AVFrame.duration; older releases use
+        # pkt_duration. Both are integer ticks in the stream time base.
+        for field in ("duration", "pkt_duration"):
+            try:
+                duration = int(frame[field])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if duration > 0:
+                durations[Fraction(timestamp) * time_base] = Fraction(duration) * time_base
+                break
     return rotation, sar, durations
 
 
