@@ -149,6 +149,16 @@ and existing native test JSON are read only. Omitting
 values null. Report numeric values must be finite; only explicitly unavailable
 historic fields are represented as JSON null.
 
+## Interactive explanation notebooks
+
+`notebooks/wpp_explorer.ipynb` is a one-video decision-probing reader. For
+cache-backed full-session class averages, use
+`notebooks/wpp_class_attribution.ipynb`; it covers train and test only, excludes
+validation, and never starts attribution until its explicit generate/resume
+control is pressed. See [class-average attribution notebook documentation](docs/wpp-class-attribution.md)
+for cache completeness, normalized coordinate semantics, interpretation, and
+PNG/CSV/JSON/ZIP downloads.
+
 ## Tests
 
 ```sh

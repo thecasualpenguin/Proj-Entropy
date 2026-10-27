@@ -5,18 +5,39 @@ import hashlib
 import json
 import shutil
 import subprocess
+from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
 from typing import Any, Mapping
 
 import numpy as np
 
-from .native_wpp_workflow import WorkflowError, probe_presentation
+from .native_wpp_workflow import PresentationProbe, WorkflowError, probe_presentation
 from .wpp_explain_types import MediaTiming
 
 
 class MediaError(ValueError):
     """A source video cannot be safely synchronized with the WPP artifact."""
+
+
+@dataclass(frozen=True)
+class ValidatedSourceMediaFrames:
+    """Source-frame identity, timeline, and display geometry without an overlay endpoint."""
+
+    source_path: Path
+    probe: PresentationProbe
+    artifact_presentation_times: tuple[Fraction, ...]
+    rotation_degrees: int
+    sample_aspect_ratio: str
+    frame_durations: Mapping[Fraction, Fraction]
+
+    @property
+    def width(self) -> int:
+        return int(self.probe.decoded_width)
+
+    @property
+    def height(self) -> int:
+        return int(self.probe.decoded_height)
 
 
 def _sha256(path: Path) -> str:
@@ -119,14 +140,14 @@ def _ffprobe_display_metadata(source: Path) -> tuple[int, str, dict[Fraction, Fr
     return rotation, sar, durations
 
 
-def source_media_timing(*, source_path: str | Path, expected_sha256: str, artifact_dir: str | Path,
-                        expected_frames: int, retained_frames: int, media_url: str | None = None) -> MediaTiming:
-    """Hash and timing-validate an original source against its native artifact.
+def validate_source_media_frames(*, source_path: str | Path, expected_sha256: str, artifact_dir: str | Path,
+                                 expected_frames: int, retained_frames: int) -> ValidatedSourceMediaFrames:
+    """Validate original-source frame identity and display geometry without deriving an endpoint.
 
-    The model's first ``retained_frames`` display frames are synchronized by
-    actual presentation timestamps, not an assumed frame rate.  A next timestamp
-    (when truncating) or validated container duration defines the last covered
-    frame's end, so a browser never silently overlays unmodeled trailing video.
+    This deliberately stops before requiring a final decoded-frame duration.
+    Spatial consumers use retained presentation-frame indices rather than elapsed
+    time, while browser overlays must call :func:`source_media_timing` for its
+    stricter final-frame endpoint validation.
     """
     if retained_frames <= 0 or expected_frames < retained_frames:
         raise MediaError("invalid retained/native frame counts")
@@ -151,14 +172,32 @@ def source_media_timing(*, source_path: str | Path, expected_sha256: str, artifa
         raise MediaError("source video has rotation metadata; explicitly create a browser media derivative with rotation baked in before overlaying WPP rows")
     if sar != "1:1":
         raise MediaError("source video has non-square sample aspect ratio; explicitly create a square-pixel browser derivative before overlaying WPP rows")
-    pts = probe.presentation_times[:retained_frames]
+    return ValidatedSourceMediaFrames(source_path=source, probe=probe, artifact_presentation_times=artifact_times,
+                                      rotation_degrees=rotation, sample_aspect_ratio=sar,
+                                      frame_durations=frame_durations)
+
+
+def source_media_timing(*, source_path: str | Path, expected_sha256: str, artifact_dir: str | Path,
+                        expected_frames: int, retained_frames: int, media_url: str | None = None) -> MediaTiming:
+    """Return strict browser-overlay timing for a validated original source.
+
+    The model's first ``retained_frames`` display frames are synchronized by
+    actual presentation timestamps, not an assumed frame rate.  A next timestamp
+    (when truncating) or validated decoded-frame duration defines the last
+    covered frame's end, so a browser never silently overlays unmodeled trailing
+    video.
+    """
+    frames = validate_source_media_frames(source_path=source_path, expected_sha256=expected_sha256,
+                                          artifact_dir=artifact_dir, expected_frames=expected_frames,
+                                          retained_frames=retained_frames)
+    pts = frames.probe.presentation_times[:retained_frames]
     if retained_frames < expected_frames:
-        end = probe.presentation_times[retained_frames]
-    elif pts[-1] in frame_durations:
+        end = frames.probe.presentation_times[retained_frames]
+    elif pts[-1] in frames.frame_durations:
         # This is a decoded frame duration in the same raw PTS time base.  Do
         # not substitute a previous VFR gap or a container duration with an
         # unknown origin.
-        end = pts[-1] + frame_durations[pts[-1]]
+        end = pts[-1] + frames.frame_durations[pts[-1]]
     else:
         raise MediaError("cannot establish the final retained frame end from decoded timestamp metadata")
     if end <= pts[-1]:
@@ -167,9 +206,9 @@ def source_media_timing(*, source_path: str | Path, expected_sha256: str, artifa
     media_seconds = np.asarray([float(item - pts[0]) for item in pts], dtype=np.float64)
     # One extra endpoint is intentionally recorded for clipping browser overlays.
     media_end = float(end - pts[0])
-    return MediaTiming(source_path=source, media_url=media_url, width=int(probe.decoded_width), height=int(probe.decoded_height),
-                       sample_aspect_ratio=sar, rotation_degrees=rotation, pts_seconds=pts_seconds,
-                       media_seconds=media_seconds, covered_end_pts_seconds=float(end),
+    return MediaTiming(source_path=frames.source_path, media_url=media_url, width=frames.width, height=frames.height,
+                       sample_aspect_ratio=frames.sample_aspect_ratio, rotation_degrees=frames.rotation_degrees,
+                       pts_seconds=pts_seconds, media_seconds=media_seconds, covered_end_pts_seconds=float(end),
                        covered_end_media_seconds=media_end, source_sha256_verified=True,
                        timing_source="ffprobe_source_pts_validated_against_native_artifact")
 

@@ -191,7 +191,7 @@ def _integrated_gradients(model: Any, normalized: torch.Tensor, rows: torch.Tens
         if previous is not None:
             total.add_(previous.add(gradient).mul_(0.5))
         previous = gradient.detach()
-        _emit(callback, "integrated_gradients", "integrating predicted logit", position + 1, steps)
+        _emit(callback, "integrated_gradients", "integrating selected logit", position + 1, steps)
     attribution = normalized * (total / float(steps - 1))
     valid = rows[:, :, None] & times[:, None, :]
     attribution = torch.where(valid, attribution, torch.zeros((), device=attribution.device, dtype=attribution.dtype))
@@ -294,13 +294,19 @@ def _artifact_directory(session: ExplainerSession, item: Mapping[str, Any]) -> P
 
 
 def _compute(session: ExplainerSession, item: Mapping[str, Any], *, ig_steps: int,
-             chunk_queries: int, callback: ProgressCallback | None) -> tuple[Prediction, np.ndarray, dict[str, float], AttentionSummary]:
+             chunk_queries: int, callback: ProgressCallback | None,
+             target_class_id: int | None = None) -> tuple[Prediction, np.ndarray, dict[str, float], AttentionSummary]:
     _, normalized, rows, times = _batch_tensors(item, session)
     with torch.no_grad():
         logits = session.model(normalized, rows, times, normalized=True)
         class_id = int(logits.argmax(dim=1).item())
         probabilities = torch.softmax(logits, dim=1)
-    ig, diagnostics = _integrated_gradients(session.model, normalized, rows, times, class_id, ig_steps, callback)
+    target = class_id if target_class_id is None else target_class_id
+    if not isinstance(target, int) or isinstance(target, bool) or not 0 <= target < logits.shape[1]:
+        raise ExplanationError(f"target_class_id must be an integer in [0, {logits.shape[1]})")
+    ig, diagnostics = _integrated_gradients(session.model, normalized, rows, times, target, ig_steps, callback)
+    diagnostics["target_class_id"] = float(target)
+    diagnostics["target_logit"] = float(logits[0, target].item())
     traced_logits, attention = _attention_summary(session.model, normalized, rows, times, row_count=int(item["row_count"]),
                                                   used_frames=int(item["used_time_length"]), chunk_queries=chunk_queries,
                                                   callback=callback)
@@ -323,8 +329,13 @@ def _move_to_cpu(session: ExplainerSession) -> None:
 
 def explain_video(session: ExplainerSession, partition: str, video_id: str, *, ig_steps: int = 32,
                   display_mode: str = "positive", attention_chunk_queries: int | None = None,
+                  target_class_id: int | None = None,
                   progress: ProgressCallback | None = None) -> VideoExplanation:
-    """Explain one video without changing any input artifact or checkpoint."""
+    """Explain one video without changing any input artifact or checkpoint.
+
+    ``target_class_id`` selects the IG logit; omitted uses the prediction.
+    Prediction and attention diagnostics always remain prediction/nonclass-specific.
+    """
     if display_mode not in ("positive", "signed"):
         raise ExplanationError("display_mode must be 'positive' or 'signed'")
     summary, item = _select_item(session, partition, video_id)
@@ -345,7 +356,8 @@ def explain_video(session: ExplainerSession, partition: str, video_id: str, *, i
     _emit(progress, "predict", f"predicting and explaining {video_id}")
     try:
         prediction, ig, diagnostics, attention = _compute(session, item, ig_steps=ig_steps,
-                                                           chunk_queries=chunk, callback=progress)
+                                                           chunk_queries=chunk, callback=progress,
+                                                           target_class_id=target_class_id)
     except RuntimeError as exc:
         if not _accelerator_runtime_error(exc, session.device):
             raise
@@ -355,10 +367,11 @@ def explain_video(session: ExplainerSession, partition: str, video_id: str, *, i
         session.fallback_reason = reason
         _emit(progress, "device_fallback", f"{reason}; rerunning this video on CPU")
         prediction, ig, diagnostics, attention = _compute(session, item, ig_steps=ig_steps,
-                                                           chunk_queries=chunk, callback=progress)
+                                                           chunk_queries=chunk, callback=progress,
+                                                           target_class_id=target_class_id)
     metadata: dict[str, Any] = {
         "method": {
-            "integrated_gradients": "trapezoid, predicted whole-video logit, train-mean raw baseline / normalized zero, fixed masks",
+            "integrated_gradients": "trapezoid, selected whole-video logit (predicted by default), train-mean raw baseline / normalized zero, fixed masks",
             "ig_steps": ig_steps, "attention": "masked mean-head residual-normalized rollout from masked-mean pooling",
             "attention_is_class_specific": False, "attention_chunk_queries": chunk,
             "attention_incoming": "mean over valid query tokens, per layer/head/key token",

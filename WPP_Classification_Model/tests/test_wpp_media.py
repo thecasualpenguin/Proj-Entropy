@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from src.native_wpp_workflow import PresentationProbe
 from src.wpp_media import (MediaError, _ffprobe_display_metadata, resolve_source_video,
-                           source_media_timing, wpp_row_boxes)
+                           source_media_timing, validate_source_media_frames, wpp_row_boxes)
 
 
 class WPPMediaTests(unittest.TestCase):
@@ -112,6 +112,51 @@ class WPPMediaTests(unittest.TestCase):
             self.assertEqual(timing.pts_seconds.tolist(), [-0.1, 0.1])
             self.assertAlmostEqual(timing.covered_end_pts_seconds, 0.2)
             self.assertAlmostEqual(timing.covered_end_media_seconds, 0.3)
+
+    def test_frame_validation_allows_missing_final_duration_but_overlay_rejects_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); source = root / "a.mp4"; source.write_bytes(b"source")
+            artifact = root / "artifact"; artifact.mkdir()
+            (artifact / "metadata.json").write_text(json.dumps({"time_base": "1/10"}), encoding="utf-8")
+            times = (Fraction(0), Fraction(1, 10), Fraction(3, 10))
+            probe = PresentationProbe(128, 130, 128, 130, "1:1", Fraction(1, 10), times)
+            arguments = dict(source_path=source, expected_sha256=hashlib.sha256(b"source").hexdigest(),
+                             artifact_dir=artifact, expected_frames=3, retained_frames=3)
+            with mock.patch("src.wpp_media._artifact_presentation_times", return_value=(times, 3)), \
+                 mock.patch("src.wpp_media.probe_presentation", return_value=(probe, {})), \
+                 mock.patch("src.wpp_media._ffprobe_display_metadata", return_value=(0, "1:1", {})):
+                frames = validate_source_media_frames(**arguments)
+                self.assertEqual((frames.source_path, frames.width, frames.height), (source.resolve(), 128, 130))
+                self.assertEqual(frames.probe.presentation_times, times)
+                with self.assertRaisesRegex(MediaError, "final retained frame end"):
+                    source_media_timing(**arguments)
+
+    def test_frame_validation_keeps_identity_timeline_and_display_rejections_strict(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); source = root / "a.mp4"; source.write_bytes(b"source")
+            artifact = root / "artifact"; artifact.mkdir()
+            (artifact / "metadata.json").write_text(json.dumps({"time_base": "1/10"}), encoding="utf-8")
+            digest = hashlib.sha256(b"source").hexdigest()
+            times = (Fraction(0), Fraction(1, 10), Fraction(2, 10))
+            probe = PresentationProbe(64, 64, 64, 64, "1:1", Fraction(1, 10), times)
+            arguments = dict(source_path=source, expected_sha256=digest, artifact_dir=artifact,
+                             expected_frames=3, retained_frames=3)
+            with self.assertRaises(MediaError):
+                validate_source_media_frames(**{**arguments, "expected_sha256": "0" * 64})
+            cases = (
+                ("artifact frame count", (times, 2), probe, (0, "1:1", {})),
+                ("source frame count", (times, 3), PresentationProbe(64, 64, 64, 64, "1:1", Fraction(1, 10), times[:2]), (0, "1:1", {})),
+                ("PTS mismatch", (times, 3), PresentationProbe(64, 64, 64, 64, "1:1", Fraction(1, 10), (Fraction(0), Fraction(1, 10), Fraction(4, 10))), (0, "1:1", {})),
+                ("rotation", (times, 3), probe, (90, "1:1", {})),
+                ("non-square SAR", (times, 3), probe, (0, "4:3", {})),
+            )
+            for name, artifact_times, source_probe, display in cases:
+                with self.subTest(name=name), \
+                     mock.patch("src.wpp_media._artifact_presentation_times", return_value=artifact_times), \
+                     mock.patch("src.wpp_media.probe_presentation", return_value=(source_probe, {})), \
+                     mock.patch("src.wpp_media._ffprobe_display_metadata", return_value=display), \
+                     self.assertRaises(MediaError):
+                    validate_source_media_frames(**arguments)
 
     def test_row_boxes_clip_final_row_and_root_cannot_escape(self):
         self.assertTrue(np.array_equal(wpp_row_boxes(rows=3, frame_height=130), np.array([[0, 64], [64, 64], [128, 2]])))

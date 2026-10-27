@@ -1,2 +1,10 @@
-# Optional interactive controls for notebooks/wpp_explorer.ipynb
+# Optional interactive controls and executable notebook support.
+# Install only in the entropy environment when notebook use is intended:
+#   conda run -n entropy python -m pip install -r requirements-notebook.txt
 ipywidgets>=8,<9
+IPython>=8,<10
+ipykernel>=6,<7
+matplotlib>=3.7
+nbformat>=5,<6
+nbclient>=0.8,<1
+jupyterlab>=4,<5

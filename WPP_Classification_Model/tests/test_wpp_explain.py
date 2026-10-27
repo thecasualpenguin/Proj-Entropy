@@ -6,13 +6,16 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 import torch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT), str(ROOT / "tests")]
-from src.wpp_explain import _attention_rollout, _integrated_gradients, _trace_attention, export_explanation
+from src.wpp_explain import _attention_rollout, _compute, _integrated_gradients, _trace_attention, export_explanation
+from src.wpp_normalization import POLICY
 from src.wpp_explain_types import (AttentionSummary, DataRoots, MediaTiming, Prediction, VideoExplanation, VideoSummary)
 from src.wpp_transformer import TIME_STEPS, WPPTransformer
 import test_wpp_dataset as _dataset_tests
@@ -25,6 +28,13 @@ class _LinearMaskedLogit(torch.nn.Module):
     def forward(self, values, rows, times, *, normalized=False):
         valid = rows[:, :, None] & times[:, None, :]
         return (values * valid).sum(dim=(1, 2), keepdim=False).unsqueeze(1)
+
+
+class _TwoLogitMaskedModel(torch.nn.Module):
+    def forward(self, values, rows, times, *, normalized=False):
+        valid = rows[:, :, None] & times[:, None, :]
+        total = (values * valid).sum(dim=(1, 2), keepdim=False)
+        return torch.stack((total, total + 1.0), dim=1)
 
 
 class WPPExplainTests(unittest.TestCase):
@@ -103,6 +113,23 @@ class WPPExplainTests(unittest.TestCase):
             self.assertTrue((destination / "figures" / "overview.png").is_file())
             with self.assertRaisesRegex(Exception, "fresh"):
                 export_explanation(explanation, destination)
+
+    def test_explicit_ig_target_does_not_change_predicted_label(self):
+        item = {"values": np.pad(np.array([[2.0, 3.0]], dtype=np.float32), ((0, 0), (0, 2998))),
+                "row_count": 1, "used_time_length": 2, "class_id": 0, "video_id": "target-test"}
+        statistics = {**POLICY, "count": 2, "mean": 0.0, "std": 1.0}
+        session = SimpleNamespace(model=_TwoLogitMaskedModel().eval(), device=torch.device("cpu"), normalization=statistics,
+                                  class_names=("truth", "predicted"))
+        def traced(model, normalized, rows, times, **_kwargs):
+            return model(normalized, rows, times, normalized=True), object()
+        with patch("src.wpp_explain._attention_summary", side_effect=traced):
+            prediction, ig, diagnostics, _ = _compute(session, item, ig_steps=5, chunk_queries=1,
+                                                        callback=None, target_class_id=0)
+        self.assertEqual(prediction.predicted_class_id, 1)
+        self.assertEqual(prediction.predicted_label, "predicted")
+        self.assertFalse(prediction.correct)
+        self.assertEqual(diagnostics["target_class_id"], 0.0)
+        self.assertAlmostEqual(float(ig.sum()), 5.0, places=6)
 
     def test_trapezoid_ig_uses_fixed_zero_baseline_and_preserves_mask(self):
         model = _LinearMaskedLogit().eval()
